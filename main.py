@@ -16,10 +16,11 @@ app.mount("/files", StaticFiles(directory=STORAGE_DIR), name="files")
 # Railway sets this automatically on the public domain; fallback for local testing.
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 
-# In-memory task tracker for async video renders.
-# NOTE: this resets if the service restarts mid-render. Fine for daily single-video use;
+# In-memory task trackers for async operations (TTS + video render).
+# NOTE: these reset if the service restarts mid-job. Fine for daily single-video use;
 # for heavier parallel use, swap this for a small SQLite/Redis store later.
 render_tasks = {}
+tts_tasks = {}
 
 
 # ============================================================
@@ -44,43 +45,56 @@ class TTSRequest(BaseModel):
     speed: float = 1.0
 
 
-@app.post("/tts")
-def generate_tts(req: TTSRequest):
-    voice = req.voice or VOICE_MAP.get(req.gender, "af_bella")
+def _run_tts(task_id: str, text: str, voice: str, speed: float):
+    try:
+        import re
+        import numpy as np
 
-    # Kokoro works best in chunks (a few thousand characters at a time) for long text.
-    # We chunk on sentence boundaries and concatenate the audio.
-    import re
-    sentences = re.split(r'(?<=[.!?])\s+', req.text.strip())
-    chunks = []
-    current = ""
-    for s in sentences:
-        if len(current) + len(s) < 2000:
-            current += " " + s
-        else:
+        # Kokoro works best in chunks (a few thousand characters at a time) for long text.
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        chunks = []
+        current = ""
+        for s in sentences:
+            if len(current) + len(s) < 2000:
+                current += " " + s
+            else:
+                chunks.append(current.strip())
+                current = s
+        if current.strip():
             chunks.append(current.strip())
-            current = s
-    if current.strip():
-        chunks.append(current.strip())
 
-    all_samples = []
-    sample_rate = None
-    for chunk in chunks:
-        if not chunk.strip():
-            continue
-        samples, sr = kokoro.create(chunk, voice=voice, speed=req.speed, lang="en-us")
-        sample_rate = sr
-        all_samples.append(samples)
+        all_samples = []
+        sample_rate = None
+        for chunk in chunks:
+            if not chunk.strip():
+                continue
+            samples, sr = kokoro.create(chunk, voice=voice, speed=speed, lang="en-us")
+            sample_rate = sr
+            all_samples.append(samples)
 
-    import numpy as np
-    full_audio = np.concatenate(all_samples) if len(all_samples) > 1 else all_samples[0]
+        full_audio = np.concatenate(all_samples) if len(all_samples) > 1 else all_samples[0]
 
-    file_id = str(uuid.uuid4())
-    filename = f"{file_id}.wav"
-    filepath = os.path.join(STORAGE_DIR, filename)
-    sf.write(filepath, full_audio, sample_rate)
+        filename = f"{task_id}.wav"
+        filepath = os.path.join(STORAGE_DIR, filename)
+        sf.write(filepath, full_audio, sample_rate)
 
-    return {"audio_url": f"{BASE_URL}/files/{filename}"}
+        tts_tasks[task_id] = {"status": "completed", "audio_url": f"{BASE_URL}/files/{filename}"}
+    except Exception as e:
+        tts_tasks[task_id] = {"status": "failed", "error": str(e)}
+
+
+@app.post("/tts")
+def generate_tts(req: TTSRequest, background_tasks: BackgroundTasks):
+    voice = req.voice or VOICE_MAP.get(req.gender, "af_bella")
+    task_id = str(uuid.uuid4())
+    tts_tasks[task_id] = {"status": "processing"}
+    background_tasks.add_task(_run_tts, task_id, req.text, voice, req.speed)
+    return {"taskId": task_id}
+
+
+@app.get("/tts/status")
+def tts_status(taskId: str):
+    return tts_tasks.get(taskId, {"status": "not_found"})
 
 
 # ============================================================
