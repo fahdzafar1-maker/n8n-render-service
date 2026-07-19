@@ -97,6 +97,42 @@ def tts_status(taskId: str):
     return tts_tasks.get(taskId, {"status": "not_found"})
 
 
+class ConcatAudioRequest(BaseModel):
+    audio_urls: List[str]   # ordered list — chapter 1 first, chapter 2 next, etc.
+
+
+@app.post("/concat-audio")
+def concat_audio(req: ConcatAudioRequest):
+    """Joins multiple chapter audio files (in the given order) into one final audio file.
+    This is a fast, non-TTS operation — runs synchronously."""
+    work_id = str(uuid.uuid4())
+    work_dir = os.path.join(STORAGE_DIR, f"concat_{work_id}")
+    os.makedirs(work_dir, exist_ok=True)
+
+    local_paths = []
+    for i, url in enumerate(req.audio_urls):
+        local_path = os.path.join(work_dir, f"chapter_{i}.wav")
+        r = requests.get(url)
+        r.raise_for_status()
+        with open(local_path, "wb") as f:
+            f.write(r.content)
+        local_paths.append(local_path)
+
+    concat_list_path = os.path.join(work_dir, "concat.txt")
+    with open(concat_list_path, "w") as f:
+        for p in local_paths:
+            f.write(f"file '{p}'\n")
+
+    final_filename = f"{work_id}_combined.wav"
+    final_path = os.path.join(STORAGE_DIR, final_filename)
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path,
+        "-c", "copy", final_path
+    ], check=True, capture_output=True)
+
+    return {"audio_url": f"{BASE_URL}/files/{final_filename}"}
+
+
 # ============================================================
 # 2. SUBTITLES  (faster-whisper, self-hosted, free, word-level timestamps)
 # ============================================================
