@@ -44,7 +44,21 @@ VOICE_MAP = {
 # Dedicated worker pool for TTS chunk generation, so a hung kokoro.create() call
 # can be timed out instead of leaving a task stuck at "processing" forever.
 _tts_executor = ThreadPoolExecutor(max_workers=2)
-CHUNK_TIMEOUT_SECONDS = 120  # generous per-chunk limit; a ~2000-char chunk should finish well under this
+CHUNK_TIMEOUT_SECONDS = 300  # covers slow cold-start inference on constrained CPU + normal generation time
+
+
+@app.on_event("startup")
+def _warm_up_kokoro():
+    """The first-ever inference call into the ONNX model is much slower than
+    subsequent calls (model warm-up on CPU). Pay that cost once here at boot,
+    instead of on the first real /tts request, so real requests don't risk
+    hitting CHUNK_TIMEOUT_SECONDS on cold start."""
+    try:
+        print("[startup] warming up Kokoro model...", flush=True)
+        kokoro.create("Warming up.", voice="af_bella", speed=1.0, lang="en-us")
+        print("[startup] Kokoro warm-up complete", flush=True)
+    except Exception as e:
+        print(f"[startup] Kokoro warm-up failed (non-fatal): {e}", flush=True)
 
 
 class TTSRequest(BaseModel):
