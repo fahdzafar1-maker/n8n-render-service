@@ -1,7 +1,10 @@
 import os
+import re
 import uuid
 import subprocess
 import requests
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import List, Optional
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
@@ -38,6 +41,11 @@ VOICE_MAP = {
     "male": "am_michael",
 }
 
+# Dedicated worker pool for TTS chunk generation, so a hung kokoro.create() call
+# can be timed out instead of leaving a task stuck at "processing" forever.
+_tts_executor = ThreadPoolExecutor(max_workers=2)
+CHUNK_TIMEOUT_SECONDS = 120  # generous per-chunk limit; a ~2000-char chunk should finish well under this
+
 
 class TTSRequest(BaseModel):
     text: str
@@ -48,10 +56,6 @@ class TTSRequest(BaseModel):
 
 def _run_tts(task_id: str, text: str, voice: str, speed: float):
     try:
-        import re
-        import numpy as np
-
-        # Kokoro works best in chunks (a few thousand characters at a time) for long text.
         sentences = re.split(r'(?<=[.!?])\s+', text.strip())
         chunks = []
         current = ""
@@ -64,12 +68,29 @@ def _run_tts(task_id: str, text: str, voice: str, speed: float):
         if current.strip():
             chunks.append(current.strip())
 
+        print(f"[TTS {task_id}] starting: {len(chunks)} chunks, total {len(text)} chars", flush=True)
+
         all_samples = []
         sample_rate = None
-        for chunk in chunks:
+        for idx, chunk in enumerate(chunks):
             if not chunk.strip():
                 continue
-            samples, sr = kokoro.create(chunk, voice=voice, speed=speed, lang="en-us")
+
+            print(f"[TTS {task_id}] chunk {idx + 1}/{len(chunks)} starting ({len(chunk)} chars)", flush=True)
+
+            future = _tts_executor.submit(kokoro.create, chunk, voice=voice, speed=speed, lang="en-us")
+            try:
+                samples, sr = future.result(timeout=CHUNK_TIMEOUT_SECONDS)
+            except FutureTimeoutError:
+                # This chunk is hung inside kokoro.create() and will never return.
+                # We can't safely kill the underlying thread, so we abandon it and
+                # fail the whole task with a clear, specific error instead of hanging forever.
+                raise RuntimeError(
+                    f"Chunk {idx + 1}/{len(chunks)} timed out after {CHUNK_TIMEOUT_SECONDS}s "
+                    f"(likely a problem character in this chunk). First 120 chars: {chunk[:120]!r}"
+                )
+
+            print(f"[TTS {task_id}] chunk {idx + 1}/{len(chunks)} done", flush=True)
             sample_rate = sr
             all_samples.append(samples)
 
@@ -79,8 +100,10 @@ def _run_tts(task_id: str, text: str, voice: str, speed: float):
         filepath = os.path.join(STORAGE_DIR, filename)
         sf.write(filepath, full_audio, sample_rate)
 
+        print(f"[TTS {task_id}] completed", flush=True)
         tts_tasks[task_id] = {"status": "completed", "audio_url": f"{BASE_URL}/files/{filename}"}
     except Exception as e:
+        print(f"[TTS {task_id}] FAILED: {e}", flush=True)
         tts_tasks[task_id] = {"status": "failed", "error": str(e)}
 
 
