@@ -4,8 +4,6 @@ import uuid
 import subprocess
 import requests
 import numpy as np
-import multiprocessing as mp
-import queue as _queue_mod
 from typing import List, Optional
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
@@ -42,75 +40,6 @@ VOICE_MAP = {
     "male": "am_michael",
 }
 
-# Chunk generation runs in a separate OS PROCESS (not a thread). A thread-based
-# timeout can't interrupt a call that hangs while holding the GIL.
-#
-# IMPORTANT: this MUST use "spawn", not "fork". Kokoro's ONNX runtime keeps its
-# own internal worker threads. Forking a multi-threaded process only copies the
-# calling thread — any lock held by one of those other threads at fork time
-# stays locked forever in the child, which deadlocks every single call. spawn
-# starts a completely clean process instead (slightly slower per chunk, since
-# the model has to load again in the child, but it cannot deadlock this way).
-_mp_ctx = mp.get_context("spawn")
-CHUNK_TIMEOUT_SECONDS = 300  # covers slow cold-start inference on constrained CPU + normal generation time
-
-
-def _kokoro_worker(chunk: str, voice: str, speed: float, result_queue):
-    """Runs in a freshly spawned child process (own memory, own model instance).
-    Sends back ('ok', samples, sr) or ('error', msg)."""
-    try:
-        from kokoro_onnx import Kokoro as _Kokoro
-        local_kokoro = _Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
-        samples, sr = local_kokoro.create(chunk, voice=voice, speed=speed, lang="en-us")
-        result_queue.put(("ok", samples, sr))
-    except Exception as e:
-        result_queue.put(("error", str(e)))
-
-
-def _generate_chunk_with_hard_timeout(chunk: str, voice: str, speed: float, timeout: int):
-    """Runs one TTS chunk in a child process and force-kills it if it doesn't
-    finish in time. Raises RuntimeError on timeout or child-side failure."""
-    result_queue = _mp_ctx.Queue()
-    proc = _mp_ctx.Process(target=_kokoro_worker, args=(chunk, voice, speed, result_queue))
-    proc.start()
-    try:
-        outcome = result_queue.get(timeout=timeout)
-    except _queue_mod.Empty:
-        proc.terminate()
-        proc.join(timeout=5)
-        if proc.is_alive():
-            proc.kill()
-            proc.join()
-        raise RuntimeError(
-            f"timed out after {timeout}s and was force-killed "
-            f"(likely a problem character/pattern in this chunk). First 120 chars: {chunk[:120]!r}"
-        )
-
-    proc.join(timeout=5)
-    if proc.is_alive():
-        proc.kill()
-        proc.join()
-
-    status = outcome[0]
-    if status == "error":
-        raise RuntimeError(f"generation failed inside worker process: {outcome[1]}")
-    _, samples, sr = outcome
-    return samples, sr
-
-
-@app.on_event("startup")
-def _warm_up_kokoro():
-    """The first-ever inference call into the ONNX model is much slower than
-    subsequent calls (model warm-up on CPU). Pay that cost once here at boot,
-    instead of on the first real /tts request, so real requests don't risk
-    hitting CHUNK_TIMEOUT_SECONDS on cold start."""
-    try:
-        print("[startup] warming up Kokoro model...", flush=True)
-        kokoro.create("Warming up.", voice="af_bella", speed=1.0, lang="en-us")
-        print("[startup] Kokoro warm-up complete", flush=True)
-    except Exception as e:
-        print(f"[startup] Kokoro warm-up failed (non-fatal): {e}", flush=True)
-
 
 class TTSRequest(BaseModel):
     text: str
@@ -133,22 +62,12 @@ def _run_tts(task_id: str, text: str, voice: str, speed: float):
         if current.strip():
             chunks.append(current.strip())
 
-        print(f"[TTS {task_id}] starting: {len(chunks)} chunks, total {len(text)} chars", flush=True)
-
         all_samples = []
         sample_rate = None
-        for idx, chunk in enumerate(chunks):
+        for chunk in chunks:
             if not chunk.strip():
                 continue
-
-            print(f"[TTS {task_id}] chunk {idx + 1}/{len(chunks)} starting ({len(chunk)} chars)", flush=True)
-
-            try:
-                samples, sr = _generate_chunk_with_hard_timeout(chunk, voice, speed, CHUNK_TIMEOUT_SECONDS)
-            except RuntimeError as chunk_err:
-                raise RuntimeError(f"Chunk {idx + 1}/{len(chunks)} {chunk_err}")
-
-            print(f"[TTS {task_id}] chunk {idx + 1}/{len(chunks)} done", flush=True)
+            samples, sr = kokoro.create(chunk, voice=voice, speed=speed, lang="en-us")
             sample_rate = sr
             all_samples.append(samples)
 
@@ -158,10 +77,8 @@ def _run_tts(task_id: str, text: str, voice: str, speed: float):
         filepath = os.path.join(STORAGE_DIR, filename)
         sf.write(filepath, full_audio, sample_rate)
 
-        print(f"[TTS {task_id}] completed", flush=True)
         tts_tasks[task_id] = {"status": "completed", "audio_url": f"{BASE_URL}/files/{filename}"}
     except Exception as e:
-        print(f"[TTS {task_id}] FAILED: {e}", flush=True)
         tts_tasks[task_id] = {"status": "failed", "error": str(e)}
 
 
