@@ -4,7 +4,8 @@ import uuid
 import subprocess
 import requests
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import multiprocessing as mp
+import queue as _queue_mod
 from typing import List, Optional
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
@@ -41,10 +42,60 @@ VOICE_MAP = {
     "male": "am_michael",
 }
 
-# Dedicated worker pool for TTS chunk generation, so a hung kokoro.create() call
-# can be timed out instead of leaving a task stuck at "processing" forever.
-_tts_executor = ThreadPoolExecutor(max_workers=2)
+# Chunk generation runs in a separate OS PROCESS (not a thread). A thread-based
+# timeout can't interrupt a call that hangs while holding the GIL.
+#
+# IMPORTANT: this MUST use "spawn", not "fork". Kokoro's ONNX runtime keeps its
+# own internal worker threads. Forking a multi-threaded process only copies the
+# calling thread — any lock held by one of those other threads at fork time
+# stays locked forever in the child, which deadlocks every single call. spawn
+# starts a completely clean process instead (slightly slower per chunk, since
+# the model has to load again in the child, but it cannot deadlock this way).
+_mp_ctx = mp.get_context("spawn")
 CHUNK_TIMEOUT_SECONDS = 300  # covers slow cold-start inference on constrained CPU + normal generation time
+
+
+def _kokoro_worker(chunk: str, voice: str, speed: float, result_queue):
+    """Runs in a freshly spawned child process (own memory, own model instance).
+    Sends back ('ok', samples, sr) or ('error', msg)."""
+    try:
+        from kokoro_onnx import Kokoro as _Kokoro
+        local_kokoro = _Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
+        samples, sr = local_kokoro.create(chunk, voice=voice, speed=speed, lang="en-us")
+        result_queue.put(("ok", samples, sr))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+
+
+def _generate_chunk_with_hard_timeout(chunk: str, voice: str, speed: float, timeout: int):
+    """Runs one TTS chunk in a child process and force-kills it if it doesn't
+    finish in time. Raises RuntimeError on timeout or child-side failure."""
+    result_queue = _mp_ctx.Queue()
+    proc = _mp_ctx.Process(target=_kokoro_worker, args=(chunk, voice, speed, result_queue))
+    proc.start()
+    try:
+        outcome = result_queue.get(timeout=timeout)
+    except _queue_mod.Empty:
+        proc.terminate()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        raise RuntimeError(
+            f"timed out after {timeout}s and was force-killed "
+            f"(likely a problem character/pattern in this chunk). First 120 chars: {chunk[:120]!r}"
+        )
+
+    proc.join(timeout=5)
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+
+    status = outcome[0]
+    if status == "error":
+        raise RuntimeError(f"generation failed inside worker process: {outcome[1]}")
+    _, samples, sr = outcome
+    return samples, sr
 
 
 @app.on_event("startup")
@@ -92,17 +143,10 @@ def _run_tts(task_id: str, text: str, voice: str, speed: float):
 
             print(f"[TTS {task_id}] chunk {idx + 1}/{len(chunks)} starting ({len(chunk)} chars)", flush=True)
 
-            future = _tts_executor.submit(kokoro.create, chunk, voice=voice, speed=speed, lang="en-us")
             try:
-                samples, sr = future.result(timeout=CHUNK_TIMEOUT_SECONDS)
-            except FutureTimeoutError:
-                # This chunk is hung inside kokoro.create() and will never return.
-                # We can't safely kill the underlying thread, so we abandon it and
-                # fail the whole task with a clear, specific error instead of hanging forever.
-                raise RuntimeError(
-                    f"Chunk {idx + 1}/{len(chunks)} timed out after {CHUNK_TIMEOUT_SECONDS}s "
-                    f"(likely a problem character in this chunk). First 120 chars: {chunk[:120]!r}"
-                )
+                samples, sr = _generate_chunk_with_hard_timeout(chunk, voice, speed, CHUNK_TIMEOUT_SECONDS)
+            except RuntimeError as chunk_err:
+                raise RuntimeError(f"Chunk {idx + 1}/{len(chunks)} {chunk_err}")
 
             print(f"[TTS {task_id}] chunk {idx + 1}/{len(chunks)} done", flush=True)
             sample_rate = sr
