@@ -21,6 +21,7 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 # for heavier parallel use, swap this for a small SQLite/Redis store later.
 render_tasks = {}
 tts_tasks = {}
+transcribe_tasks = {}
 
 
 # ============================================================
@@ -145,27 +146,51 @@ class TranscribeRequest(BaseModel):
     audio_url: str
 
 
+def _run_transcribe(task_id: str, audio_url: str):
+    """Runs Whisper in the background so long audio (50+ min) doesn't hit the
+    gateway request timeout (which was causing 502 Bad Gateway)."""
+    local_path = os.path.join(STORAGE_DIR, f"transcribe_{task_id}.wav")
+    try:
+        # download with a generous timeout for large files
+        r = requests.get(audio_url, timeout=600)
+        r.raise_for_status()
+        with open(local_path, "wb") as f:
+            f.write(r.content)
+
+        segments, _info = whisper_model.transcribe(local_path, word_timestamps=True)
+
+        words = []
+        for seg in segments:
+            for w in seg.words:
+                words.append({
+                    "word": w.word.strip(),
+                    "start": round(w.start, 3),
+                    "end": round(w.end, 3),
+                })
+
+        transcribe_tasks[task_id] = {"status": "completed", "words": words}
+    except Exception as e:
+        transcribe_tasks[task_id] = {"status": "failed", "error": str(e), "words": []}
+    finally:
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+
+
 @app.post("/transcribe")
-def transcribe(req: TranscribeRequest):
-    local_path = os.path.join(STORAGE_DIR, f"transcribe_{uuid.uuid4()}.wav")
-    r = requests.get(req.audio_url)
-    r.raise_for_status()
-    with open(local_path, "wb") as f:
-        f.write(r.content)
+def transcribe(req: TranscribeRequest, background_tasks: BackgroundTasks):
+    """Submit a transcription job. Returns a taskId immediately; poll /transcribe/status."""
+    task_id = str(uuid.uuid4())
+    transcribe_tasks[task_id] = {"status": "processing"}
+    background_tasks.add_task(_run_transcribe, task_id, req.audio_url)
+    return {"taskId": task_id}
 
-    segments, _info = whisper_model.transcribe(local_path, word_timestamps=True)
 
-    words = []
-    for seg in segments:
-        for w in seg.words:
-            words.append({
-                "word": w.word.strip(),
-                "start": round(w.start, 3),
-                "end": round(w.end, 3),
-            })
-
-    os.remove(local_path)
-    return {"words": words}
+@app.get("/transcribe/status")
+def transcribe_status(taskId: str):
+    return transcribe_tasks.get(taskId, {"status": "not_found"})
 
 
 # ============================================================
