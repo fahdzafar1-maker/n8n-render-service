@@ -1,6 +1,7 @@
 import os
 import re
 import uuid
+import shutil
 import subprocess
 import requests
 import numpy as np
@@ -158,10 +159,14 @@ def concat_audio(req: ConcatAudioRequest):
 
     final_filename = f"{work_id}_combined.wav"
     final_path = os.path.join(STORAGE_DIR, final_filename)
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path,
-        "-c", "copy", final_path
-    ], check=True, capture_output=True)
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path,
+            "-c", "copy", final_path
+        ], check=True, capture_output=True)
+    finally:
+        # Clean up per-chapter source files — only the combined file needs to stay.
+        shutil.rmtree(work_dir, ignore_errors=True)
 
     return {"audio_url": f"{BASE_URL}/files/{final_filename}"}
 
@@ -357,6 +362,12 @@ def _run_render(task_id: str, payload: dict):
         render_tasks[task_id] = {"status": "failed", "error": e.stderr.decode()[-800:] if e.stderr else str(e)}
     except Exception as e:
         render_tasks[task_id] = {"status": "failed", "error": str(e)}
+    finally:
+        # Always clean up the working folder (source images, per-chapter video
+        # segments, raw audio) — whether the render succeeded or failed. Only
+        # the final .mp4 (saved directly under STORAGE_DIR, not work_dir) survives.
+        if os.path.exists(work_dir):
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @app.post("/render")
