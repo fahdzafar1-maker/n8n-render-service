@@ -38,6 +38,12 @@ def download_file(url: str, dest_path: str, timeout: int = 600):
     it, extracts the confirm token, and retries with it — so callers never
     get a fake HTML file saved as .mp3/.png."""
     session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+    })
     response = session.get(url, stream=True, timeout=timeout)
     content_type = response.headers.get("Content-Type", "")
 
@@ -381,6 +387,72 @@ def submit_render(req: RenderRequest, background_tasks: BackgroundTasks):
 @app.get("/render/status")
 def render_status(taskId: str):
     return render_tasks.get(taskId, {"status": "not_found"})
+
+
+# ============================================================
+# 4. CLEANUP  — free up storage/compute once files are no longer needed
+# ============================================================
+import time
+
+
+@app.delete("/files/{filename}")
+def delete_file(filename: str):
+    """Delete one specific file (e.g. call this from n8n right after the
+    final video has been successfully uploaded to Google Drive)."""
+    path = os.path.join(STORAGE_DIR, filename)
+    # guard against path traversal — only allow deleting files directly inside STORAGE_DIR
+    if os.path.dirname(path) != STORAGE_DIR.rstrip("/"):
+        return {"status": "error", "message": "invalid filename"}
+    if os.path.exists(path):
+        os.remove(path)
+        return {"status": "deleted", "filename": filename}
+    return {"status": "not_found", "filename": filename}
+
+
+class CleanupRequest(BaseModel):
+    older_than_hours: float = 24.0   # delete files older than this; 0 = delete everything
+
+
+@app.post("/cleanup")
+def cleanup(req: CleanupRequest = CleanupRequest()):
+    """Safety-net endpoint: deletes any file (and any leftover folder) sitting
+    directly in STORAGE_DIR older than `older_than_hours`. Normal renders/concat
+    jobs already clean up their own working folders — this catches anything that
+    was left behind by a crash, a killed deploy, or an old test run."""
+    cutoff = time.time() - (req.older_than_hours * 3600)
+    deleted = []
+    for name in os.listdir(STORAGE_DIR):
+        path = os.path.join(STORAGE_DIR, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+                deleted.append(name)
+        except FileNotFoundError:
+            pass
+    return {"status": "ok", "deleted_count": len(deleted), "deleted": deleted}
+
+
+@app.get("/storage-usage")
+def storage_usage():
+    """Quick check of what's currently sitting in storage, without needing the console."""
+    items = []
+    total_bytes = 0
+    for name in os.listdir(STORAGE_DIR):
+        path = os.path.join(STORAGE_DIR, name)
+        if os.path.isdir(path):
+            size = sum(
+                os.path.getsize(os.path.join(dp, f))
+                for dp, _, files in os.walk(path) for f in files
+            )
+        else:
+            size = os.path.getsize(path)
+        total_bytes += size
+        items.append({"name": name, "size_mb": round(size / (1024 * 1024), 2)})
+    items.sort(key=lambda x: -x["size_mb"])
+    return {"total_mb": round(total_bytes / (1024 * 1024), 2), "items": items}
 
 
 @app.get("/")
