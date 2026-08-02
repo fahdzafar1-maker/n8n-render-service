@@ -5,6 +5,7 @@ import subprocess
 import requests
 import numpy as np
 from typing import List, Optional
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -24,6 +25,42 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 render_tasks = {}
 tts_tasks = {}
 transcribe_tasks = {}
+
+
+# ============================================================
+# 0. SHARED HELPER — robust file download (handles Google Drive
+#    large-file "can't scan for viruses" warning page transparently)
+# ============================================================
+def download_file(url: str, dest_path: str, timeout: int = 600):
+    """Downloads a file. If Google Drive returns its virus-scan warning HTML
+    page instead of the actual file (happens for files >100MB), this detects
+    it, extracts the confirm token, and retries with it — so callers never
+    get a fake HTML file saved as .mp3/.png."""
+    session = requests.Session()
+    response = session.get(url, stream=True, timeout=timeout)
+    content_type = response.headers.get("Content-Type", "")
+
+    if "text/html" in content_type:
+        html = response.text
+        confirm_match = re.search(r'confirm=([0-9A-Za-z_-]+)', html)
+        uuid_match = re.search(r'name="uuid" value="([0-9a-zA-Z-]+)"', html)
+
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        query["confirm"] = [confirm_match.group(1) if confirm_match else "t"]
+        if uuid_match:
+            query["uuid"] = [uuid_match.group(1)]
+
+        new_query = urlencode({k: v[0] for k, v in query.items()})
+        retry_url = urlunparse(parsed._replace(query=new_query))
+
+        response = session.get(retry_url, stream=True, timeout=timeout)
+
+    response.raise_for_status()
+    with open(dest_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=1 << 20):
+            if chunk:
+                f.write(chunk)
 
 
 # ============================================================
@@ -111,10 +148,7 @@ def concat_audio(req: ConcatAudioRequest):
     local_paths = []
     for i, url in enumerate(req.audio_urls):
         local_path = os.path.join(work_dir, f"chapter_{i}.wav")
-        r = requests.get(url)
-        r.raise_for_status()
-        with open(local_path, "wb") as f:
-            f.write(r.content)
+        download_file(url, local_path)
         local_paths.append(local_path)
 
     concat_list_path = os.path.join(work_dir, "concat.txt")
@@ -150,10 +184,7 @@ def _run_transcribe(task_id: str, audio_url: str):
     local_path = os.path.join(STORAGE_DIR, f"transcribe_{task_id}.wav")
     try:
         # download with a generous timeout for large files
-        r = requests.get(audio_url, timeout=600)
-        r.raise_for_status()
-        with open(local_path, "wb") as f:
-            f.write(r.content)
+        download_file(audio_url, local_path, timeout=600)
 
         segments, _info = whisper_model.transcribe(local_path, word_timestamps=True)
 
@@ -235,10 +266,7 @@ def _run_render(task_id: str, payload: dict):
 
         # --- download voiceover audio ---
         audio_path = os.path.join(work_dir, "audio.mp3")
-        r = requests.get(payload["audio_url"])
-        r.raise_for_status()
-        with open(audio_path, "wb") as f:
-            f.write(r.content)
+        download_file(payload["audio_url"], audio_path)
 
         duration = float(subprocess.check_output([
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -253,10 +281,7 @@ def _run_render(task_id: str, payload: dict):
         image_paths = []
         for i, img in enumerate(images):
             img_path = os.path.join(work_dir, f"img_{i}.png")
-            r = requests.get(img["image_url"])
-            r.raise_for_status()
-            with open(img_path, "wb") as f:
-                f.write(r.content)
+            download_file(img["image_url"], img_path)
             image_paths.append(img_path)
 
         # --- subtitles file (bigger chunks, since they now sit in a wide text panel) ---
