@@ -259,26 +259,42 @@ def _run_render(task_id: str, payload: dict):
                 f.write(r.content)
             image_paths.append(img_path)
 
-        # --- subtitles file ---
+        # --- subtitles file (bigger chunks, since they now sit in a wide text panel) ---
         srt_path = os.path.join(work_dir, "subs.srt")
-        _write_srt(payload["subtitle_words"], srt_path)
+        _write_srt(payload["subtitle_words"], srt_path, words_per_chunk=9)
 
-        # --- Ken Burns pan/zoom per image, then concat ---
+        # --- split-screen layout: left = plain panel carrying the subtitle text,
+        # right = the Ken Burns pan/zoom of the scene image ---
         fps = 25
         w, h = (1920, 1080) if payload.get("aspect_ratio", "16:9") == "16:9" else (1080, 1920)
+        left_w = w // 2
+        right_w = w - left_w
+        bg_color = "0xF2EBDD"  # plain warm background for the text panel
+
         segment_paths = []
         for i, img_path in enumerate(image_paths):
-            seg_path = os.path.join(work_dir, f"seg_{i}.mp4")
+            # 1. Ken Burns pan/zoom of the image, rendered directly at right-half size
+            right_seg_path = os.path.join(work_dir, f"right_{i}.mp4")
             frames = max(int(per_image_duration * fps), fps)
             zoom_in = (i % 2 == 0)
             if zoom_in:
-                zoompan = f"zoompan=z='min(zoom+0.0006,1.12)':d={frames}:s={w}x{h}:fps={fps}"
+                zoompan = f"zoompan=z='min(zoom+0.0006,1.12)':d={frames}:s={right_w}x{h}:fps={fps}"
             else:
-                zoompan = f"zoompan=z='if(lte(on,1),1.12,max(1.0,zoom-0.0006))':d={frames}:s={w}x{h}:fps={fps}"
+                zoompan = f"zoompan=z='if(lte(on,1),1.12,max(1.0,zoom-0.0006))':d={frames}:s={right_w}x{h}:fps={fps}"
             subprocess.run([
                 "ffmpeg", "-y", "-loop", "1", "-i", img_path,
-                "-vf", f"scale={w*2}:{h*2},{zoompan}",
+                "-vf", f"scale={right_w*2}:{h*2},{zoompan}",
                 "-t", str(per_image_duration),
+                "-pix_fmt", "yuv420p", right_seg_path
+            ], check=True, capture_output=True)
+
+            # 2. composite: plain background panel (left) + the Ken Burns clip (right)
+            seg_path = os.path.join(work_dir, f"seg_{i}.mp4")
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:d={per_image_duration}",
+                "-i", right_seg_path,
+                "-filter_complex", f"[0:v][1:v]overlay=x={left_w}:y=0:shortest=1",
                 "-pix_fmt", "yuv420p", seg_path
             ], check=True, capture_output=True)
             segment_paths.append(seg_path)
@@ -294,13 +310,15 @@ def _run_render(task_id: str, payload: dict):
             "-c", "copy", concat_video_path
         ], check=True, capture_output=True)
 
-        # --- add voiceover audio + burn subtitles ---
+        # --- add voiceover audio + burn subtitles, confined to the left panel ---
+        # MarginR pushes the wrap boundary so text never crosses into the image side.
         final_path = os.path.join(work_dir, "final.mp4")
         subprocess.run([
             "ffmpeg", "-y", "-i", concat_video_path, "-i", audio_path,
             "-vf",
-            f"subtitles={srt_path}:force_style='FontName=Arial Black,FontSize=26,"
-            f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=2,Alignment=2'",
+            f"subtitles={srt_path}:force_style='FontName=Arial,FontSize=40,Bold=1,"
+            f"PrimaryColour=&H00000000,OutlineColour=&H00FFFFFF,BorderStyle=1,"
+            f"Outline=1,Shadow=0,Alignment=4,MarginL=70,MarginR={right_w + 40}'",
             "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-shortest", final_path
         ], check=True, capture_output=True)
 
