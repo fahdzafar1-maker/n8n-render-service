@@ -33,10 +33,16 @@ transcribe_tasks = {}
 #    large-file "can't scan for viruses" warning page transparently)
 # ============================================================
 def download_file(url: str, dest_path: str, timeout: int = 600):
-    """Downloads a file. If Google Drive returns its virus-scan warning HTML
-    page instead of the actual file (happens for files >100MB), this detects
-    it, extracts the confirm token, and retries with it — so callers never
-    get a fake HTML file saved as .mp3/.png."""
+    """Downloads a file to dest_path.
+
+    Google Drive serves files over 100MB behind a "can't scan for viruses"
+    interstitial. That page is an HTML <form> that posts back to a DIFFERENT
+    endpoint (drive.usercontent.google.com/download) carrying a per-request
+    `uuid` token. Rebuilding the URL by hand against the original
+    drive.google.com/uc endpoint does NOT work — that token is only valid on
+    the endpoint the form names, and Drive answers with 404. So: parse the
+    form's action plus every hidden input, and submit exactly that.
+    """
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
@@ -44,30 +50,63 @@ def download_file(url: str, dest_path: str, timeout: int = 600):
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
     })
+
     response = session.get(url, stream=True, timeout=timeout)
-    content_type = response.headers.get("Content-Type", "")
 
-    if "text/html" in content_type:
+    if "text/html" in response.headers.get("Content-Type", ""):
         html = response.text
-        confirm_match = re.search(r'confirm=([0-9A-Za-z_-]+)', html)
-        uuid_match = re.search(r'name="uuid" value="([0-9a-zA-Z-]+)"', html)
 
-        parsed = urlparse(url)
-        query = parse_qs(parsed.query)
-        query["confirm"] = [confirm_match.group(1) if confirm_match else "t"]
-        if uuid_match:
-            query["uuid"] = [uuid_match.group(1)]
+        action_match = re.search(
+            r'<form[^>]+id="download-form"[^>]+action="([^"]+)"', html
+        ) or re.search(r'<form[^>]+action="([^"]+)"', html)
 
-        new_query = urlencode({k: v[0] for k, v in query.items()})
-        retry_url = urlunparse(parsed._replace(query=new_query))
+        # every <input type="hidden" name="..." value="..."> in the page
+        params = dict(
+            re.findall(
+                r'<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"',
+                html,
+            )
+        )
+
+        if action_match:
+            action = action_match.group(1).replace("&amp;", "&")
+            # the action itself may already carry query params; merge, don't drop
+            parsed = urlparse(action)
+            merged = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+            merged.update(params)
+            merged.setdefault("confirm", "t")
+            retry_url = urlunparse(parsed._replace(query=urlencode(merged)))
+        else:
+            # Fallback: stay on whatever URL we were actually redirected to
+            # (response.url), not the original one, and just add confirm.
+            parsed = urlparse(response.url)
+            merged = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+            merged.update(params)
+            merged["confirm"] = "t"
+            retry_url = urlunparse(parsed._replace(query=urlencode(merged)))
 
         response = session.get(retry_url, stream=True, timeout=timeout)
 
+        if "text/html" in response.headers.get("Content-Type", ""):
+            raise RuntimeError(
+                f"Google Drive kept returning an HTML page instead of the file "
+                f"for {url} — check the file is shared as 'Anyone with the link'."
+            )
+
     response.raise_for_status()
+
     with open(dest_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=1 << 20):
             if chunk:
                 f.write(chunk)
+
+    # An HTML error page saved as audio.mp3 is the failure mode that has cost
+    # us the most time; fail loudly and early instead of letting ffprobe choke.
+    if os.path.getsize(dest_path) < 10000:
+        raise RuntimeError(
+            f"Downloaded file from {url} is only {os.path.getsize(dest_path)} bytes "
+            f"— that is not the real media file."
+        )
 
 
 # ============================================================
@@ -309,28 +348,27 @@ def _run_render(task_id: str, payload: dict):
 
         segment_paths = []
         for i, img_path in enumerate(image_paths):
-            # 1. Ken Burns pan/zoom of the image, rendered directly at right-half size
-            right_seg_path = os.path.join(work_dir, f"right_{i}.mp4")
+            # Single pass: Ken Burns pan/zoom rendered at right-half size, then
+            # padded onto the full canvas with the plain text-panel colour on the
+            # left. (Previously this was two separate encodes — zoompan then a
+            # colour+overlay pass — which roughly doubled render time for no gain.)
+            seg_path = os.path.join(work_dir, f"seg_{i}.mp4")
             frames = max(int(per_image_duration * fps), fps)
             zoom_in = (i % 2 == 0)
             if zoom_in:
                 zoompan = f"zoompan=z='min(zoom+0.0006,1.12)':d={frames}:s={right_w}x{h}:fps={fps}"
             else:
                 zoompan = f"zoompan=z='if(lte(on,1),1.12,max(1.0,zoom-0.0006))':d={frames}:s={right_w}x{h}:fps={fps}"
+
+            vf = (
+                f"scale={right_w*2}:{h*2},{zoompan},"
+                f"pad={w}:{h}:{left_w}:0:color={bg_color}"
+            )
             subprocess.run([
                 "ffmpeg", "-y", "-loop", "1", "-i", img_path,
-                "-vf", f"scale={right_w*2}:{h*2},{zoompan}",
+                "-vf", vf,
                 "-t", str(per_image_duration),
-                "-pix_fmt", "yuv420p", right_seg_path
-            ], check=True, capture_output=True)
-
-            # 2. composite: plain background panel (left) + the Ken Burns clip (right)
-            seg_path = os.path.join(work_dir, f"seg_{i}.mp4")
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-f", "lavfi", "-i", f"color=c={bg_color}:s={w}x{h}:d={per_image_duration}",
-                "-i", right_seg_path,
-                "-filter_complex", f"[0:v][1:v]overlay=x={left_w}:y=0:shortest=1",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                 "-pix_fmt", "yuv420p", seg_path
             ], check=True, capture_output=True)
             segment_paths.append(seg_path)
