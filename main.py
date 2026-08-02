@@ -493,6 +493,42 @@ def storage_usage():
     return {"total_mb": round(total_bytes / (1024 * 1024), 2), "items": items}
 
 
+# ============================================================
+# 5. UPLOAD  — accept a file directly from n8n (raw binary body)
+# ============================================================
+# Google Drive refuses to serve files >100MB to unauthenticated servers.
+# Rather than fight that, n8n downloads the file with its own OAuth
+# credential and POSTs the bytes here; we hand back a plain URL that
+# ffmpeg/ffprobe can fetch with zero friction.
+# Streamed to disk so a 250MB upload never sits in memory.
+from fastapi import Request
+
+
+@app.post("/upload")
+async def upload(request: Request, filename: str = "upload.bin"):
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[-80:]
+    stored_name = f"{uuid.uuid4()}_{safe_name}"
+    dest_path = os.path.join(STORAGE_DIR, stored_name)
+
+    size = 0
+    with open(dest_path, "wb") as f:
+        async for chunk in request.stream():
+            if chunk:
+                f.write(chunk)
+                size += len(chunk)
+
+    if size == 0:
+        os.remove(dest_path)
+        return {"status": "error", "message": "empty upload — no bytes received"}
+
+    return {
+        "status": "ok",
+        "filename": stored_name,
+        "bytes": size,
+        "file_url": f"{BASE_URL}/files/{stored_name}",
+    }
+
+
 @app.get("/")
 def health():
     return {"status": "ok"}
