@@ -398,7 +398,7 @@ def _run_render(task_id: str, payload: dict):
         subprocess.run([
             "ffmpeg", "-y", "-i", concat_video_path, "-i", audio_path,
             "-vf",
-            f"subtitles={srt_path}:force_style='FontName=Arial,FontSize=52,Bold=1,"
+            f"subtitles={srt_path}:original_size={w}x{h}:force_style='FontName=Arial,FontSize=52,Bold=1,"
             f"PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,ShadowColour=&H00000000,"
             f"BorderStyle=1,Outline=2,Shadow=3,Alignment=2,MarginL=90,MarginR=90,MarginV=70'",
             "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-shortest", final_path
