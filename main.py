@@ -284,29 +284,53 @@ class RenderRequest(BaseModel):
     ken_burns: bool = True
 
 
-def _format_srt_time(t: float) -> str:
+def _format_ass_time(t: float) -> str:
     h = int(t // 3600)
     m = int((t % 3600) // 60)
     s = t % 60
-    return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ",")
+    cs = int((s - int(s)) * 100)  # centiseconds
+    return f"{h:d}:{m:02d}:{int(s):02d}.{cs:02d}"
 
 
-def _write_srt(words: List[dict], path: str, words_per_chunk: int = 5):
-    """Groups words into short chunks for big, catchy on-screen captions."""
+def _write_ass(words: List[dict], path: str, w: int, h: int, words_per_chunk: int = 5):
+    """Writes a self-contained .ass subtitle file with an explicit PlayResX/
+    PlayResY matching the actual video frame. This is the fix for the
+    'gigantic subtitles' bug: when a plain .srt is burned via ffmpeg's
+    subtitles filter, ffmpeg converts it to ASS internally and has to GUESS
+    the canvas size — that guess does not reliably match the real video
+    resolution, so the font ends up wildly oversized or undersized. Writing
+    the .ass ourselves removes the guesswork entirely: what we declare here
+    is exactly what libass renders against.
+    """
     chunks, chunk = [], []
-    for w in words:
-        chunk.append(w)
+    for word in words:
+        chunk.append(word)
         if len(chunk) >= words_per_chunk:
             chunks.append(chunk)
             chunk = []
     if chunk:
         chunks.append(chunk)
 
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {w}
+PlayResY: {h}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,{int(h * 0.048)},&H0000FFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,2,3,2,{int(w * 0.047)},{int(w * 0.047)},{int(h * 0.065)},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
     with open(path, "w", encoding="utf-8") as f:
-        for i, c in enumerate(chunks):
+        f.write(header)
+        for c in chunks:
             start, end = c[0]["start"], c[-1]["end"]
-            text = " ".join(w["word"] for w in c).upper()
-            f.write(f"{i + 1}\n{_format_srt_time(start)} --> {_format_srt_time(end)}\n{text}\n\n")
+            text = " ".join(word["word"] for word in c).upper()
+            f.write(f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Default,,0,0,0,,{text}\n")
 
 
 def _run_render(task_id: str, payload: dict):
@@ -334,10 +358,6 @@ def _run_render(task_id: str, payload: dict):
             download_file(img["image_url"], img_path)
             image_paths.append(img_path)
 
-        # --- subtitles file: short bursts so text never overflows the frame ---
-        srt_path = os.path.join(work_dir, "subs.srt")
-        _write_srt(payload["subtitle_words"], srt_path, words_per_chunk=5)
-
         # --- full-bleed layout: the scene image fills the entire frame with a
         # Ken Burns pan/zoom. A soft gradient — clear at the top, fading to black
         # toward the bottom — sits behind the subtitle area so captions stay
@@ -345,6 +365,11 @@ def _run_render(task_id: str, payload: dict):
         # (which is normally framed in the upper/middle two-thirds of the image). ---
         fps = 25
         w, h = (1920, 1080) if payload.get("aspect_ratio", "16:9") == "16:9" else (1080, 1920)
+
+        # --- subtitles file: short bursts, own PlayResX/PlayResY so the font
+        # renders at the correct size against this exact frame — no guessing. ---
+        ass_path = os.path.join(work_dir, "subs.ass")
+        _write_ass(payload["subtitle_words"], ass_path, w, h, words_per_chunk=5)
 
         # Build the gradient overlay once (reused for every segment).
         gradient_path = os.path.join(work_dir, "gradient.png")
@@ -393,14 +418,12 @@ def _run_render(task_id: str, payload: dict):
         ], check=True, capture_output=True)
 
         # --- add voiceover audio + burn subtitles, bottom-centered over the
-        # gradient. Bold yellow text with a black shadow, like the reference style. ---
+        # gradient. Bold yellow text with a black shadow — all styling is
+        # already baked into the .ass file itself, so no force_style needed. ---
         final_path = os.path.join(work_dir, "final.mp4")
         subprocess.run([
             "ffmpeg", "-y", "-i", concat_video_path, "-i", audio_path,
-            "-vf",
-            f"subtitles={srt_path}:original_size={w}x{h}:force_style='FontName=Arial,FontSize=52,Bold=1,"
-            f"PrimaryColour=&H0000FFFF,OutlineColour=&H00000000,ShadowColour=&H00000000,"
-            f"BorderStyle=1,Outline=2,Shadow=3,Alignment=2,MarginL=90,MarginR=90,MarginV=70'",
+            "-vf", f"ass={ass_path}",
             "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-shortest", final_path
         ], check=True, capture_output=True)
 
