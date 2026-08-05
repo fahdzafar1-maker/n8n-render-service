@@ -352,7 +352,7 @@ def _run_render(task_id: str, payload: dict):
         subprocess.run([
             "ffmpeg", "-y", "-f", "lavfi",
             "-i", f"color=c=black:s={w}x{h}:d=1,format=yuva420p,"
-                  f"geq=lum_expr=0:cb_expr=128:cr_expr=128:a_expr='{gradient_alpha_expr}'",
+                  f"geq=lum=0:cb=128:cr=128:a='{gradient_alpha_expr}'",
             "-frames:v", "1", gradient_path
         ], check=True, capture_output=True)
 
