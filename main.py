@@ -277,7 +277,7 @@ def transcribe_status(taskId: str):
 # ============================================================
 class RenderRequest(BaseModel):
     story_title: str
-    images: List[dict]           # [{ "chapter_number": 1, "image_url": "..." }, ...]
+    images: List[dict]           # [{ "chapter_number": 1, "image_url": "...", "duration": 12.5 }, ...]
     audio_url: str
     subtitle_words: List[dict]   # [{ "word": "...", "start": 0.1, "end": 0.4 }, ...]
     aspect_ratio: str = "16:9"
@@ -349,7 +349,23 @@ def _run_render(task_id: str, payload: dict):
 
         images = sorted(payload["images"], key=lambda x: x["chapter_number"])
         n = len(images)
-        per_image_duration = duration / n
+
+        # --- per-shot durations -------------------------------------------
+        # Splitting the audio evenly across every image assumes each shot is
+        # narrated for the same length of time. It is not: a rank reveal runs
+        # long, a one-line aside runs short. When the caller sends a `duration`
+        # on each image, those are treated as SHARES and rescaled so they add
+        # up to the real audio length exactly — the pictures then stay in step
+        # with the voice for the whole video.
+        #
+        # No durations supplied -> even split, exactly as before. That is what
+        # keeps the older storytelling pipeline working without any change.
+        raw = [float(img.get("duration") or 0) for img in images]
+        if raw and all(r > 0 for r in raw):
+            scale = duration / sum(raw)
+            durations = [r * scale for r in raw]
+        else:
+            durations = [duration / n] * n
 
         # --- download scene images ---
         image_paths = []
@@ -386,7 +402,8 @@ def _run_render(task_id: str, payload: dict):
             # Single pass: Ken Burns pan/zoom at full frame size, with the
             # bottom gradient composited on top in the same ffmpeg call.
             seg_path = os.path.join(work_dir, f"seg_{i}.mp4")
-            frames = max(int(per_image_duration * fps), fps)
+            seg_duration = durations[i]
+            frames = max(int(seg_duration * fps), fps)
             zoom_in = (i % 2 == 0)
             if zoom_in:
                 zoompan = f"zoompan=z='min(zoom+0.0006,1.12)':d={frames}:s={w}x{h}:fps={fps}"
@@ -400,7 +417,7 @@ def _run_render(task_id: str, payload: dict):
                 "-filter_complex",
                 f"[0:v]scale={w*2}:{h*2},{zoompan}[zoomed];[zoomed][1:v]overlay=0:0[out]",
                 "-map", "[out]",
-                "-t", str(per_image_duration),
+                "-t", str(seg_duration),
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                 "-pix_fmt", "yuv420p", seg_path
             ], check=True, capture_output=True)
