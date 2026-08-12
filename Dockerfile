@@ -25,7 +25,7 @@ RUN wget -q -O kokoro-v1.0.int8.onnx \
     wget -q -O voices-v1.0.bin \
       https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 
-COPY main.py .
+COPY main.py visuals.py us_paths.json .
 
 RUN mkdir -p /data/storage
 
