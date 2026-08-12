@@ -7,3 +7,4 @@ soundfile==0.12.1
 numpy>=2.0.2
 faster-whisper==1.0.3
 pydantic==2.9.2
+cairosvg
