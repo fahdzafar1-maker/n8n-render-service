@@ -8,8 +8,11 @@ import numpy as np
 from typing import List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from fastapi import FastAPI, BackgroundTasks
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+import visuals
 
 app = FastAPI(title="Calm Drama Stories - Render Service")
 
@@ -277,7 +280,13 @@ def transcribe_status(taskId: str):
 # ============================================================
 class RenderRequest(BaseModel):
     story_title: str
-    images: List[dict]           # [{ "chapter_number": 1, "image_url": "...", "duration": 12.5 }, ...]
+    # Each image is either a URL to fetch, or a visual_spec this service draws
+    # itself. Drawing locally is preferred: the graphic is built from the same
+    # design system every time, and there is no external chart service deciding
+    # what our video looks like.
+    #   { "chapter_number": 1, "visual_spec": {...}, "duration": 12.5, "camera_motion": "none" }
+    #   { "chapter_number": 1, "image_url": "https://...", "duration": 12.5 }
+    images: List[dict]
     audio_url: str
     subtitle_words: List[dict]   # [{ "word": "...", "start": 0.1, "end": 0.4 }, ...]
     aspect_ratio: str = "16:9"
@@ -367,11 +376,15 @@ def _run_render(task_id: str, payload: dict):
         else:
             durations = [duration / n] * n
 
-        # --- download scene images ---
+        # --- obtain scene images: draw a spec, or fetch a URL ---
         image_paths = []
         for i, img in enumerate(images):
             img_path = os.path.join(work_dir, f"img_{i}.png")
-            download_file(img["image_url"], img_path)
+            spec = img.get("visual_spec")
+            if spec:
+                visuals.render_png(spec, img_path)
+            else:
+                download_file(img["image_url"], img_path)
             image_paths.append(img_path)
 
         # --- full-bleed layout: the scene image fills the entire frame with a
@@ -389,7 +402,11 @@ def _run_render(task_id: str, payload: dict):
 
         # Build the gradient overlay once (reused for every segment).
         gradient_path = os.path.join(work_dir, "gradient.png")
-        gradient_alpha_expr = f"if(gte(Y,H*0.55),(Y-H*0.55)/(H*0.45)*190,0)"
+        # The gradient exists so captions stay readable. It used to start at 55%
+        # of frame height, which put a wash over the lower half of every chart.
+        # Graphics are drawn to keep meaning above 80%, so the gradient starts
+        # there and stays lighter.
+        gradient_alpha_expr = f"if(gte(Y,H*0.78),(Y-H*0.78)/(H*0.22)*205,0)"
         subprocess.run([
             "ffmpeg", "-y", "-f", "lavfi",
             "-i", f"color=c=black:s={w}x{h}:d=1,format=yuva420p,"
@@ -404,18 +421,29 @@ def _run_render(task_id: str, payload: dict):
             seg_path = os.path.join(work_dir, f"seg_{i}.mp4")
             seg_duration = durations[i]
             frames = max(int(seg_duration * fps), fps)
-            zoom_in = (i % 2 == 0)
-            if zoom_in:
-                zoompan = f"zoompan=z='min(zoom+0.0006,1.12)':d={frames}:s={w}x{h}:fps={fps}"
+
+            # Camera motion is decided per shot by the caller, not by position.
+            # Ken Burns on a chart is the single worst thing you can do to one:
+            # it drifts the figures out of frame and makes a clean graphic look
+            # like a phone video of a monitor. Charts, stats and cards hold
+            # perfectly still. Only photos and maps move, and only gently.
+            motion = str(images[i].get("camera_motion") or "none").lower()
+            if motion == "slow_zoom":
+                chain = (f"scale={w*2}:{h*2},"
+                         f"zoompan=z='min(zoom+0.00035,1.06)':d={frames}:s={w}x{h}:fps={fps}")
+            elif motion == "slow_zoom_out":
+                chain = (f"scale={w*2}:{h*2},"
+                         f"zoompan=z='if(lte(on,1),1.06,max(1.0,zoom-0.00035))':d={frames}:s={w}x{h}:fps={fps}")
             else:
-                zoompan = f"zoompan=z='if(lte(on,1),1.12,max(1.0,zoom-0.0006))':d={frames}:s={w}x{h}:fps={fps}"
+                chain = f"scale={w}:{h}:force_original_aspect_ratio=decrease," \
+                        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=0x0f172a,fps={fps}"
 
             subprocess.run([
                 "ffmpeg", "-y",
                 "-loop", "1", "-i", img_path,
                 "-loop", "1", "-i", gradient_path,
                 "-filter_complex",
-                f"[0:v]scale={w*2}:{h*2},{zoompan}[zoomed];[zoomed][1:v]overlay=0:0[out]",
+                f"[0:v]{chain}[zoomed];[zoomed][1:v]overlay=0:0[out]",
                 "-map", "[out]",
                 "-t", str(seg_duration),
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
@@ -473,6 +501,28 @@ def submit_render(req: RenderRequest, background_tasks: BackgroundTasks):
 @app.get("/render/status")
 def render_status(taskId: str):
     return render_tasks.get(taskId, {"status": "not_found"})
+
+
+class VisualPreviewRequest(BaseModel):
+    spec: dict
+
+
+@app.post("/visual")
+def visual_preview(req: VisualPreviewRequest):
+    """Draw one graphic and return the PNG directly.
+
+    Exists so a visual can be checked in a browser in a second, instead of
+    waiting ten minutes for a render to find out a label was cut off.
+    """
+    tmp = os.path.join(STORAGE_DIR, f"preview_{uuid.uuid4()}.png")
+    try:
+        visuals.render_png(req.spec, tmp)
+        with open(tmp, "rb") as f:
+            data = f.read()
+        return Response(content=data, media_type="image/png")
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 # ============================================================
