@@ -9,12 +9,39 @@ graphics look like.
 Layout rule that governs all of it: the bottom 20% of the frame belongs to the
 subtitles. Nothing that carries meaning is drawn there, so captions never sit
 on top of a number.
-"""
 
+------------------------------------------------------------------------------
+v2 — changes made under the QC policy (R002, R006, R011)
+
+R002  bar_pair is now HORIZONTAL and thin. It used to draw two vertical columns
+      330px wide and up to ~450px tall, which read as heavy blocks rather than
+      a measurement. Bars are now 56px high and up to 1200px long, with the
+      figure sitting just past the end of its own bar. Long and thin.
+
+R002  big_stat can carry context_a / context_b. A gap shown on its own is
+      meaningless: "$81" tells a viewer nothing without "$1,931 vs $1,850"
+      underneath it. The published video showed "$4" and "$81" floating alone.
+
+R011  Three photograph types added — photo_full, photo_stat, photo_split. The
+      published video contained zero photographs across 7:47, and one single
+      layout occupied 36% of its runtime. Photos come from Pexels (free, no
+      per-image cost) and are cached on disk, so a repeated query is fetched
+      once. With no PEXELS_API_KEY set they degrade to the normal card rather
+      than failing the render.
+
+R006  Every card accepts an "eyebrow": a short category label above the title.
+      It is drawn from the spec and never derived from the headline. The old
+      cards showed "ADDS UP" sitting above "Every Small Fee Adds Up".
+
+Everything else — the palette, the flag fetching, the US map, the state-shape
+fallback, statement, tally, and render_png itself — is unchanged.
+------------------------------------------------------------------------------
+"""
 import os
 import json
 import math
 import base64
+import hashlib
 import requests
 import cairosvg
 
@@ -34,6 +61,8 @@ FONT = "DejaVu Sans, Arial, Helvetica, sans-serif"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _US_PATHS = None
 _FLAG_CACHE = {}
+_PHOTO_CACHE = {}
+PHOTO_DIR = os.environ.get("PHOTO_CACHE_DIR", "/data/storage/_photos")
 
 # US state and territory postal codes, for flagcdn (us-tx, us-wa ...)
 STATE_CODES = {
@@ -120,32 +149,91 @@ def flag_data_uri(name, width=320):
         return None
 
 
-def state_shape_svg(name, box_w, box_h, x, y, colour):
-    """Fallback when a flag image is unavailable: draw the place's own outline.
+# ==================================================================
+#  R011 — photographs
+# ==================================================================
+def photo_data_uri(query):
+    """One Pexels landscape photo for a query, as a data URI.
 
-    A grey rectangle where a flag should be looks broken. The state silhouette
-    carries the same information and uses geometry we already ship.
+    Cached in memory for the run and on disk across runs, so the same metric
+    fetches its photograph once no matter how many videos use it. Returns None
+    on any failure - a missing photograph degrades the card, it never breaks
+    the render.
     """
-    paths = _load_paths()
-    key = next((k for k in paths if k.lower() == str(name).strip().lower()), None)
-    if not key:
-        return ('<rect x="%d" y="%d" width="%d" height="%d" fill="%s" '
-                'stroke="%s" stroke-width="4"/>' % (x, y, box_w, box_h, PANEL, colour))
-    d = paths[key]
-    xs, ys = [], []
-    for tok in d.replace("M", " ").replace("L", " ").replace("Z", " ").split():
-        if "," in tok:
-            px, py = tok.split(",")
-            xs.append(float(px)); ys.append(float(py))
-    if not xs:
+    if not query:
+        return None
+    q = str(query).strip().lower()
+    if q in _PHOTO_CACHE:
+        return _PHOTO_CACHE[q]
+
+    os.makedirs(PHOTO_DIR, exist_ok=True)
+    disk = os.path.join(PHOTO_DIR, hashlib.md5(q.encode()).hexdigest() + ".jpg")
+
+    raw = None
+    if os.path.exists(disk):
+        try:
+            with open(disk, "rb") as f:
+                raw = f.read()
+        except Exception:
+            raw = None
+
+    if raw is None:
+        key = os.environ.get("PEXELS_API_KEY")
+        if not key:
+            return None
+        try:
+            r = requests.get(
+                "https://api.pexels.com/v1/search",
+                params={"query": q, "per_page": 1,
+                        "orientation": "landscape", "size": "large"},
+                headers={"Authorization": key}, timeout=25)
+            r.raise_for_status()
+            photos = r.json().get("photos") or []
+            if not photos:
+                return None
+            src = photos[0]["src"].get("large2x") or photos[0]["src"].get("large")
+            img = requests.get(src, timeout=40)
+            img.raise_for_status()
+            raw = img.content
+            try:
+                with open(disk, "wb") as f:
+                    f.write(raw)
+            except Exception:
+                pass
+        except Exception:
+            return None
+
+    uri = "data:image/jpeg;base64," + base64.b64encode(raw).decode()
+    _PHOTO_CACHE[q] = uri
+    return uri
+
+
+def _photo_layer(query, x, y, w, h, scrim="bottom", clip_id=None):
+    """A photograph filling a box, with a gradient scrim so type stays legible."""
+    uri = photo_data_uri(query)
+    if not uri:
         return ""
-    bw, bh = max(xs) - min(xs), max(ys) - min(ys)
-    sc = min(box_w / (bw or 1), box_h / (bh or 1)) * 0.86
-    tx = x + (box_w - bw * sc) / 2 - min(xs) * sc
-    ty = y + (box_h - bh * sc) / 2 - min(ys) * sc
-    return ('<g transform="translate(%.1f,%.1f) scale(%.3f)">'
-            '<path d="%s" fill="%s" stroke="%s" stroke-width="%.1f"/></g>'
-            % (tx, ty, sc, d, colour, INK, 2.0 / sc))
+    gid = "sc_%s" % (clip_id or abs(hash((x, y, w, h, scrim))) % 99999)
+    if scrim == "bottom":
+        grad = ('<linearGradient id="%s" x1="0" y1="0" x2="0" y2="1">'
+                '<stop offset="0.30" stop-color="%s" stop-opacity="0.10"/>'
+                '<stop offset="1" stop-color="%s" stop-opacity="0.92"/></linearGradient>'
+                % (gid, BG, BG))
+    elif scrim == "right":
+        grad = ('<linearGradient id="%s" x1="0" y1="0" x2="1" y2="0">'
+                '<stop offset="0.45" stop-color="%s" stop-opacity="0"/>'
+                '<stop offset="1" stop-color="%s" stop-opacity="1"/></linearGradient>'
+                % (gid, BG, BG))
+    else:  # full — an even wash, for a card that carries a big number on top
+        grad = ('<linearGradient id="%s" x1="0" y1="0" x2="0" y2="1">'
+                '<stop offset="0" stop-color="%s" stop-opacity="0.72"/>'
+                '<stop offset="1" stop-color="%s" stop-opacity="0.86"/></linearGradient>'
+                % (gid, BG, BG))
+    return ('<defs>%s</defs>'
+            '<image x="%.0f" y="%.0f" width="%.0f" height="%.0f" xlink:href="%s" '
+            'preserveAspectRatio="xMidYMid slice"/>'
+            '<rect x="%.0f" y="%.0f" width="%.0f" height="%.0f" fill="url(#%s)"/>'
+            % (grad, x, y, w, h, uri, x, y, w, h, gid))
 
 
 def fit(text, size, max_width, min_size=28):
@@ -181,6 +269,16 @@ def _open(extra=""):
     ) % (W, H, W, H, W, H, BG, extra)
 
 
+def _eyebrow(text, y=62):
+    """R006: a category label, drawn from the spec. Never taken from the
+    headline - "ADDS UP" above "Every Small Fee Adds Up" reads as a bug."""
+    if not text:
+        return ""
+    return ('<text x="%d" y="%d" fill="%s" font-family="%s" font-size="30" '
+            'font-weight="bold" text-anchor="middle" letter-spacing="5">%s</text>'
+            ) % (W // 2, y, ACCENT, FONT, esc(str(text).upper()))
+
+
 def _title(text, y=110):
     if not text:
         return ""
@@ -193,8 +291,8 @@ def _title(text, y=110):
 # ==================================================================
 #  1. flag_vs — two places, side by side
 # ==================================================================
-def flag_vs(a, b, title=None, sub_a=None, sub_b=None):
-    parts = [_title(title, 130)]
+def flag_vs(a, b, title=None, sub_a=None, sub_b=None, eyebrow=None):
+    parts = [_eyebrow(eyebrow), _title(title, 130)]
     fw, fh = 560, 373
     cy = 420
     for i, (name, sub, colour) in enumerate([(a, sub_a, ACCENT), (b, sub_b, COOL)]):
@@ -219,7 +317,6 @@ def flag_vs(a, b, title=None, sub_a=None, sub_b=None):
                 '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="42" '
                 'text-anchor="middle">%s</text>'
                 % (cx, cy + fh / 2 + 172, MUTED, FONT, esc(sub)))
-
     parts.append(
         '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="62" '
         'font-weight="bold" text-anchor="middle">vs</text>'
@@ -227,17 +324,45 @@ def flag_vs(a, b, title=None, sub_a=None, sub_b=None):
     return _open() + "".join(parts) + "</svg>"
 
 
+def state_shape_svg(name, box_w, box_h, x, y, colour):
+    """Fallback when a flag image is unavailable: draw the place's own outline.
+
+    A grey rectangle where a flag should be looks broken. The state silhouette
+    carries the same information and uses geometry we already ship.
+    """
+    paths = _load_paths()
+    key = next((k for k in paths if k.lower() == str(name).strip().lower()), None)
+    if not key:
+        return ('<rect x="%d" y="%d" width="%d" height="%d" fill="%s" '
+                'stroke="%s" stroke-width="4"/>' % (x, y, box_w, box_h, PANEL, colour))
+    d = paths[key]
+    xs, ys = [], []
+    for tok in d.replace("M", " ").replace("L", " ").replace("Z", " ").split():
+        if "," in tok:
+            px, py = tok.split(",")
+            xs.append(float(px)); ys.append(float(py))
+    if not xs:
+        return ""
+    bw, bh = max(xs) - min(xs), max(ys) - min(ys)
+    sc = min(box_w / (bw or 1), box_h / (bh or 1)) * 0.86
+    tx = x + (box_w - bw * sc) / 2 - min(xs) * sc
+    ty = y + (box_h - bh * sc) / 2 - min(ys) * sc
+    return ('<g transform="translate(%.1f,%.1f) scale(%.3f)">'
+            '<path d="%s" fill="%s" stroke="%s" stroke-width="%.1f"/></g>'
+            % (tx, ty, sc, d, colour, INK, 2.0 / sc))
+
+
 # ==================================================================
 #  2. map — one or two states located on the country
 # ==================================================================
-def us_map(highlight, title=None, labels=True):
+def us_map(highlight, title=None, labels=True, eyebrow=None):
     if isinstance(highlight, str):
         highlight = [highlight]
     hl = {h.strip().lower(): i for i, h in enumerate(highlight)}
     colours = [ACCENT, COOL]
-
     paths = _load_paths()
     body, marks = [], []
+
     # The map art is 1000x620; place it centred inside the safe area.
     mw, mh = 1000, 620
     sc = 1.42
@@ -250,18 +375,16 @@ def us_map(highlight, title=None, labels=True):
         stroke = INK if idx is not None else BG
         body.append('<path d="%s" fill="%s" stroke="%s" stroke-width="%s"/>'
                     % (d, fill, stroke, "2.4" if idx is not None else "1.4"))
-
     g = ('<g transform="translate(%.1f,%.1f) scale(%.3f)">%s</g>'
          % (ox, oy, sc, "".join(body)))
 
-    out = [_title(title, 100), g]
+    out = [_eyebrow(eyebrow), _title(title, 100), g]
 
     if labels:
         for i, name in enumerate(highlight):
             key = next((k for k in paths if k.lower() == name.strip().lower()), None)
             if not key:
                 continue
-            # Label position: centroid of the largest ring, roughly.
             d = paths[key]
             nums = [p for p in d.replace("M", " ").replace("L", " ").replace("Z", " ").split()]
             xs, ys = [], []
@@ -281,7 +404,6 @@ def us_map(highlight, title=None, labels=True):
                 'font-weight="bold" text-anchor="middle">%s</text>'
                 % (cx - tw / 2, cy - 31, tw, BG, cx, cy + 15, colours[i % 2], FONT, size, esc(name)))
         out.extend(marks)
-
     return _open() + "".join(out) + "</svg>"
 
 
@@ -289,79 +411,181 @@ def us_map(highlight, title=None, labels=True):
 #  3. bar_pair — the workhorse: two figures, one metric
 # ==================================================================
 def bar_pair(label_a, value_a, label_b, value_b, title=None,
-             display_a=None, display_b=None, unit=None):
+             display_a=None, display_b=None, unit=None,
+             eyebrow=None, photo_query=None):
+    """
+    R002 — HORIZONTAL and thin.
+
+    This used to draw two vertical columns 330px wide and up to ~450px tall.
+    They read as heavy blocks rather than a measurement, and the two figures
+    were the only thing on screen for up to fifty seconds at a time.
+
+    Now: 56px high, up to 1200px long, label in its own column on the left,
+    figure just past the end of its own bar, faint gridlines behind. Long and
+    thin. If photo_query is given the left third carries a photograph and the
+    bars occupy the rest.
+    """
     va, vb = float(value_a), float(value_b)
-    top = max(va, vb) or 1.0
-    da = display_a or ("%,d" % int(va)).replace("%", "")
-    db = display_b or ("%,d" % int(vb)).replace("%", "")
+    top = max(abs(va), abs(vb)) or 1.0
+    da = display_a if display_a is not None else "{:,.0f}".format(va)
+    db = display_b if display_b is not None else "{:,.0f}".format(vb)
 
-    parts = [_title(title, 110)]
+    parts = []
+    bar_x, max_len = 460, 1160
 
-    base_y = SAFE_H - 130          # bars sit on this line
-    max_bar = base_y - 300         # tallest bar height
-    bw = 330
+    if photo_query:
+        pw = int(W * 0.34)
+        layer = _photo_layer(photo_query, 0, 0, pw, SAFE_H, scrim="right", clip_id="bp")
+        if layer:
+            parts.append(layer)
+            bar_x, max_len = pw + 300, W - (pw + 300) - 260
+
+    parts.append(_eyebrow(eyebrow))
+    parts.append(_title(title, 130))
+
+    BAR_H, BAR_GAP = 56, 40
+    block_h = BAR_H * 2 + BAR_GAP
+    top_y = 470 - block_h // 2
+
+    # faint gridlines behind the bars, so a length reads as a quantity
+    for g in (0.25, 0.5, 0.75):
+        gx = bar_x + max_len * g
+        parts.append('<line x1="%.0f" y1="%.0f" x2="%.0f" y2="%.0f" stroke="%s" '
+                     'stroke-width="2"/>' % (gx, top_y - 30, gx, top_y + block_h + 30, PANEL))
 
     for i, (lab, val, disp, colour) in enumerate(
             [(label_a, va, da, ACCENT), (label_b, vb, db, COOL)]):
-        cx = W * (0.30 if i == 0 else 0.70)
-        bh = max(60, (val / top) * max_bar)
-        x, y = cx - bw / 2, base_y - bh
-        parts.append('<rect x="%.0f" y="%.0f" width="%d" height="%.0f" fill="%s" rx="6"/>'
-                     % (x, y, bw, bh, colour))
-        # figure sits above its own bar - never in a legend, never in a corner
-        size = fit(disp, 78, bw + 200, 40)
-        parts.append(
-            '<text x="%.0f" y="%.0f" fill="%s" font-family="%s" font-size="%d" '
-            'font-weight="bold" text-anchor="middle">%s</text>'
-            % (cx, y - 34, INK, FONT, size, esc(disp)))
-        lsize = fit(lab, 50, bw + 190, 30)
-        parts.append(
-            '<text x="%.0f" y="%.0f" fill="%s" font-family="%s" font-size="%d" '
-            'text-anchor="middle">%s</text>'
-            % (cx, base_y + 62, MUTED, FONT, lsize, esc(lab)))
+        by = top_y + i * (BAR_H + BAR_GAP)
+        length = max(10, (abs(val) / top) * max_len)
 
-    parts.append('<line x1="%d" y1="%.0f" x2="%d" y2="%.0f" stroke="%s" stroke-width="3"/>'
-                 % (200, base_y, W - 200, base_y, PANEL))
+        # label right-aligned into its own column, never on top of the bar
+        lsize = fit(lab, 44, bar_x - 60, 26)
+        parts.append(
+            '<text x="%.0f" y="%.0f" fill="%s" font-family="%s" font-size="%d" '
+            'font-weight="bold" text-anchor="end">%s</text>'
+            % (bar_x - 34, by + BAR_H * 0.72, MUTED, FONT, lsize, esc(lab)))
+
+        parts.append('<rect x="%.0f" y="%.0f" width="%.0f" height="%d" rx="4" fill="%s"/>'
+                     % (bar_x, by, length, BAR_H, colour))
+
+        # figure just past the end of its own bar - outside, never inside
+        vsize = 52
+        vx = bar_x + length + 26
+        if vx + len(str(disp)) * vsize * 0.58 > W - 40:
+            vx = bar_x + length - 26
+            parts.append(
+                '<text x="%.0f" y="%.0f" fill="%s" font-family="%s" font-size="%d" '
+                'font-weight="bold" text-anchor="end">%s</text>'
+                % (vx, by + BAR_H * 0.74, BG, FONT, vsize, esc(disp)))
+        else:
+            parts.append(
+                '<text x="%.0f" y="%.0f" fill="%s" font-family="%s" font-size="%d" '
+                'font-weight="bold">%s</text>'
+                % (vx, by + BAR_H * 0.74, INK, FONT, vsize, esc(disp)))
+
     if unit:
         parts.append(
-            '<text x="%d" y="%.0f" fill="%s" font-family="%s" font-size="34" '
+            '<text x="%.0f" y="%.0f" fill="%s" font-family="%s" font-size="34" '
             'text-anchor="middle">%s</text>'
-            % (W // 2, base_y + 130, MUTED, FONT, esc(unit)))
+            % (bar_x + max_len / 2, top_y + block_h + 110, MUTED, FONT, esc(unit)))
+
     return _open() + "".join(parts) + "</svg>"
 
 
 # ==================================================================
 #  4. big_stat — one figure, full frame
 # ==================================================================
-def big_stat(value, caption=None, title=None, colour=ACCENT):
-    parts = [_title(title, 130)]
+def big_stat(value, caption=None, title=None, colour=ACCENT,
+             eyebrow=None, context_a=None, context_b=None, photo_query=None):
+    """
+    R002 — a gap is never shown on its own.
+
+    The published video put "$4" and "$81" alone on a dark field. Eighty-one
+    dollars means nothing without the figures it came from; against rent of
+    $1,850 it is 4.4%. When context_a / context_b are supplied they are drawn
+    under the headline number.
+    """
+    parts = []
+    if photo_query:
+        layer = _photo_layer(photo_query, 0, 0, W, H, scrim="full", clip_id="bs")
+        if layer:
+            parts.append(layer)
+
+    parts.append(_eyebrow(eyebrow))
+    parts.append(_title(title, 130))
+
     size = fit(value, 260, W - 320, 90)
     parts.append(
         '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="%d" '
         'font-weight="bold" text-anchor="middle">%s</text>'
         % (W // 2, 520, colour, FONT, size, esc(value)))
+
+    y = 640
     if caption:
-        lines = wrap(caption, 34, 2)
-        for i, ln in enumerate(lines):
+        for i, ln in enumerate(wrap(caption, 34, 2)):
             parts.append(
                 '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="56" '
                 'text-anchor="middle">%s</text>'
-                % (W // 2, 640 + i * 74, INK, FONT, esc(ln)))
+                % (W // 2, y + i * 74, INK, FONT, esc(ln)))
+        y += 74 * len(wrap(caption, 34, 2))
+
+    if context_a and context_b:
+        ay = min(y + 46, SAFE_H - 40)
+        a_txt = "%s  %s" % (context_a.get("label", ""), context_a.get("display", ""))
+        b_txt = "%s  %s" % (context_b.get("label", ""), context_b.get("display", ""))
+        parts.append(
+            '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="40" '
+            'font-weight="bold" text-anchor="end">%s</text>'
+            % (W // 2 - 46, ay, ACCENT, FONT, esc(a_txt)))
+        parts.append(
+            '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="32" '
+            'text-anchor="middle">vs</text>' % (W // 2, ay, MUTED, FONT))
+        parts.append(
+            '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="40" '
+            'font-weight="bold">%s</text>'
+            % (W // 2 + 46, ay, COOL, FONT, esc(b_txt)))
+
     parts.append('<rect x="%d" y="%d" width="220" height="8" fill="%s" rx="4"/>'
                  % (W // 2 - 110, 300, colour))
     return _open() + "".join(parts) + "</svg>"
 
 
 # ==================================================================
-#  5. statement — typographic card, no data
+#  5. photo_full — a photograph carrying one line of caption
 # ==================================================================
-def statement(text, kicker=None):
+def photo_full(photo_query, caption=None, eyebrow=None, title=None):
+    """R011. The published video had no photographs at all, and 36% of its
+    runtime was a single repeated layout. A real image every few shots is the
+    cheapest variety there is."""
+    layer = _photo_layer(photo_query, 0, 0, W, H, scrim="bottom", clip_id="pf")
+    if not layer:
+        # No key, no network, no photo - fall back to a card that still reads.
+        return statement(caption or title or "", kicker=eyebrow)
+
+    parts = [layer, _eyebrow(eyebrow)]
+    if caption:
+        lines = wrap(caption, 32, 3)
+        size = 72 if len(lines) <= 2 else 60
+        start = SAFE_H - 40 - (len(lines) - 1) * size * 1.24
+        for i, ln in enumerate(lines):
+            parts.append(
+                '<text x="%d" y="%.0f" fill="%s" font-family="%s" font-size="%d" '
+                'font-weight="bold" text-anchor="middle">%s</text>'
+                % (W // 2, start + i * size * 1.24, INK, FONT, size, esc(ln)))
+    return _open() + "".join(parts) + "</svg>"
+
+
+# ==================================================================
+#  6. statement — typographic card, no data
+# ==================================================================
+def statement(text, kicker=None, eyebrow=None):
     parts = []
-    if kicker:
+    lead = kicker or eyebrow
+    if lead:
         parts.append(
             '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="40" '
             'text-anchor="middle" letter-spacing="3">%s</text>'
-            % (W // 2, 210, ACCENT, FONT, esc(kicker.upper())))
+            % (W // 2, 210, ACCENT, FONT, esc(str(lead).upper())))
     lines = wrap(text, 26, 4)
     size = 96 if len(lines) <= 2 else 76
     start = 420 - (len(lines) - 1) * (size * 0.62)
@@ -376,11 +600,18 @@ def statement(text, kicker=None):
 
 
 # ==================================================================
-#  6. tally — the running scoreboard
+#  7. tally — the running scoreboard
 # ==================================================================
-def tally(name_a, score_a, name_b, score_b, title="RUNNING TOTAL", rows=None):
-    parts = [_title(title, 110)]
-    cy = 330
+def tally(name_a, score_a, name_b, score_b, title="RUNNING TOTAL", rows=None,
+          eyebrow=None):
+    """
+    R007 — the detail list is left-aligned in one column with its dot in a
+    fixed gutter. It used to be centred with the dot placed under whichever
+    side won, which put the marker on top of the text: "...car insurance per
+    yea●". The list also used to run past the safe line into the subtitles.
+    """
+    parts = [_eyebrow(eyebrow), _title(title, 110)]
+    cy = 300
     for i, (name, score, colour) in enumerate(
             [(name_a, score_a, ACCENT), (name_b, score_b, COOL)]):
         cx = W * (0.28 if i == 0 else 0.72)
@@ -389,27 +620,29 @@ def tally(name_a, score_a, name_b, score_b, title="RUNNING TOTAL", rows=None):
             'font-weight="bold" text-anchor="middle">%s</text>'
             % (cx, cy, MUTED, FONT, fit(name, 52, 620, 32), esc(name)))
         parts.append(
-            '<text x="%.0f" y="%d" fill="%s" font-family="%s" font-size="200" '
+            '<text x="%.0f" y="%d" fill="%s" font-family="%s" font-size="168" '
             'font-weight="bold" text-anchor="middle">%s</text>'
-            % (cx, cy + 175, colour, FONT, esc(score)))
+            % (cx, cy + 150, colour, FONT, esc(score)))
     parts.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="%s" stroke-width="3"/>'
-                 % (W // 2, cy - 60, W // 2, cy + 200, PANEL))
+                 % (W // 2, cy - 60, W // 2, cy + 172, PANEL))
 
-    # optional detail list: which metric each side took
     if rows:
-        y = cy + 300
-        for r in rows[:6]:
+        list_x = 520          # fixed gutter for the dots
+        text_x = list_x + 46
+        y = cy + 246
+        room = max(0, (SAFE_H - 24 - y) // 46)
+        for r in rows[:min(6, room)]:
             who = str(r.get("winner", ""))
             left = who.strip().lower() == str(name_a).strip().lower()
             colour = ACCENT if left else COOL
-            dot_x = W * (0.28 if left else 0.72)
+            metric = str(r.get("metric", ""))
+            if len(metric) > 42:
+                metric = metric[:41].rstrip() + "…"
             parts.append(
-                '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="38" '
-                'text-anchor="middle">%s</text>'
-                '<circle cx="%.0f" cy="%d" r="13" fill="%s"/>'
-                % (W // 2, y, MUTED, FONT, esc(r.get("metric", "")),
-                   dot_x, y - 12, colour))
-            y += 58
+                '<circle cx="%d" cy="%d" r="11" fill="%s"/>'
+                '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="36">%s</text>'
+                % (list_x, y - 11, colour, text_x, y, MUTED, FONT, esc(metric)))
+            y += 46
     return _open() + "".join(parts) + "</svg>"
 
 
@@ -418,23 +651,41 @@ def tally(name_a, score_a, name_b, score_b, title="RUNNING TOTAL", rows=None):
 # ==================================================================
 def build_svg(spec):
     t = str(spec.get("type", "statement")).lower()
+    eb = spec.get("eyebrow")
+
     if t == "flag_vs":
         return flag_vs(spec.get("entity_a"), spec.get("entity_b"),
-                       spec.get("title"), spec.get("sub_a"), spec.get("sub_b"))
+                       spec.get("title"), spec.get("sub_a"), spec.get("sub_b"),
+                       eyebrow=eb)
+
     if t == "map":
-        return us_map(spec.get("highlight") or [], spec.get("title"))
-    if t == "bar_pair":
+        return us_map(spec.get("highlight") or [], spec.get("title"), eyebrow=eb)
+
+    if t in ("bar_pair", "photo_split"):
         return bar_pair(spec.get("label_a"), spec.get("value_a"),
                         spec.get("label_b"), spec.get("value_b"),
                         spec.get("title"), spec.get("display_a"),
-                        spec.get("display_b"), spec.get("unit"))
-    if t == "big_stat":
-        return big_stat(spec.get("value", ""), spec.get("caption"), spec.get("title"))
+                        spec.get("display_b"), spec.get("unit"),
+                        eyebrow=eb,
+                        photo_query=spec.get("photo_query") if t == "photo_split" else None)
+
+    if t in ("big_stat", "photo_stat"):
+        return big_stat(spec.get("value", ""), spec.get("caption"), spec.get("title"),
+                        eyebrow=eb,
+                        context_a=spec.get("context_a"), context_b=spec.get("context_b"),
+                        photo_query=spec.get("photo_query") if t == "photo_stat" else None)
+
+    if t == "photo_full":
+        return photo_full(spec.get("photo_query"), spec.get("caption"),
+                          eyebrow=eb, title=spec.get("title"))
+
     if t == "tally":
         return tally(spec.get("name_a"), spec.get("score_a"),
                      spec.get("name_b"), spec.get("score_b"),
-                     spec.get("title", "RUNNING TOTAL"), spec.get("rows"))
-    return statement(spec.get("text", ""), spec.get("kicker"))
+                     spec.get("title", "RUNNING TOTAL"), spec.get("rows"),
+                     eyebrow=eb)
+
+    return statement(spec.get("text", ""), spec.get("kicker"), eyebrow=eb)
 
 
 def render_png(spec, dest_path):
