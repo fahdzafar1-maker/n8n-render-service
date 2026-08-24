@@ -1,18 +1,21 @@
 import os
 import re
+import json
 import uuid
 import shutil
+import tempfile
 import subprocess
+import urllib.request
 import requests
 import numpy as np
 from typing import List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-
 import visuals
+import qc_gate
 
 app = FastAPI(title="Calm Drama Stories - Render Service")
 
@@ -22,6 +25,9 @@ app.mount("/files", StaticFiles(directory=STORAGE_DIR), name="files")
 
 # Railway sets this automatically on the public domain; fallback for local testing.
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
+
+# Directory this file lives in — used to find bed.mp3 beside main.py (R008).
+_HERE_MAIN = os.path.dirname(os.path.abspath(__file__))
 
 # In-memory task trackers for async operations (TTS + video render).
 # NOTE: these reset if the service restarts mid-job. Fine for daily single-video use;
@@ -37,7 +43,6 @@ transcribe_tasks = {}
 # ============================================================
 def download_file(url: str, dest_path: str, timeout: int = 600):
     """Downloads a file to dest_path.
-
     Google Drive serves files over 100MB behind a "can't scan for viruses"
     interstitial. That page is an HTML <form> that posts back to a DIFFERENT
     endpoint (drive.usercontent.google.com/download) carrying a per-request
@@ -53,16 +58,12 @@ def download_file(url: str, dest_path: str, timeout: int = 600):
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
     })
-
     response = session.get(url, stream=True, timeout=timeout)
-
     if "text/html" in response.headers.get("Content-Type", ""):
         html = response.text
-
         action_match = re.search(
             r'<form[^>]+id="download-form"[^>]+action="([^"]+)"', html
         ) or re.search(r'<form[^>]+action="([^"]+)"', html)
-
         # every <input type="hidden" name="..." value="..."> in the page
         params = dict(
             re.findall(
@@ -70,7 +71,6 @@ def download_file(url: str, dest_path: str, timeout: int = 600):
                 html,
             )
         )
-
         if action_match:
             action = action_match.group(1).replace("&amp;", "&")
             # the action itself may already carry query params; merge, don't drop
@@ -87,22 +87,17 @@ def download_file(url: str, dest_path: str, timeout: int = 600):
             merged.update(params)
             merged["confirm"] = "t"
             retry_url = urlunparse(parsed._replace(query=urlencode(merged)))
-
         response = session.get(retry_url, stream=True, timeout=timeout)
-
         if "text/html" in response.headers.get("Content-Type", ""):
             raise RuntimeError(
                 f"Google Drive kept returning an HTML page instead of the file "
                 f"for {url} — check the file is shared as 'Anyone with the link'."
             )
-
     response.raise_for_status()
-
     with open(dest_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=1 << 20):
             if chunk:
                 f.write(chunk)
-
     # An HTML error page saved as audio.mp3 is the failure mode that has cost
     # us the most time; fail loudly and early instead of letting ffprobe choke.
     if os.path.getsize(dest_path) < 10000:
@@ -147,7 +142,6 @@ def _run_tts(task_id: str, text: str, voice: str, speed: float):
                 current = s
         if current.strip():
             chunks.append(current.strip())
-
         all_samples = []
         sample_rate = None
         for chunk in chunks:
@@ -156,13 +150,10 @@ def _run_tts(task_id: str, text: str, voice: str, speed: float):
             samples, sr = kokoro.create(chunk, voice=voice, speed=speed, lang="en-us")
             sample_rate = sr
             all_samples.append(samples)
-
         full_audio = np.concatenate(all_samples) if len(all_samples) > 1 else all_samples[0]
-
         filename = f"{task_id}.wav"
         filepath = os.path.join(STORAGE_DIR, filename)
         sf.write(filepath, full_audio, sample_rate)
-
         tts_tasks[task_id] = {"status": "completed", "audio_url": f"{BASE_URL}/files/{filename}"}
     except Exception as e:
         tts_tasks[task_id] = {"status": "failed", "error": str(e)}
@@ -193,18 +184,15 @@ def concat_audio(req: ConcatAudioRequest):
     work_id = str(uuid.uuid4())
     work_dir = os.path.join(STORAGE_DIR, f"concat_{work_id}")
     os.makedirs(work_dir, exist_ok=True)
-
     local_paths = []
     for i, url in enumerate(req.audio_urls):
         local_path = os.path.join(work_dir, f"chapter_{i}.wav")
         download_file(url, local_path)
         local_paths.append(local_path)
-
     concat_list_path = os.path.join(work_dir, "concat.txt")
     with open(concat_list_path, "w") as f:
         for p in local_paths:
             f.write(f"file '{p}'\n")
-
     final_filename = f"{work_id}_combined.wav"
     final_path = os.path.join(STORAGE_DIR, final_filename)
     try:
@@ -215,7 +203,6 @@ def concat_audio(req: ConcatAudioRequest):
     finally:
         # Clean up per-chapter source files — only the combined file needs to stay.
         shutil.rmtree(work_dir, ignore_errors=True)
-
     return {"audio_url": f"{BASE_URL}/files/{final_filename}"}
 
 
@@ -238,9 +225,7 @@ def _run_transcribe(task_id: str, audio_url: str):
     try:
         # download with a generous timeout for large files
         download_file(audio_url, local_path, timeout=600)
-
         segments, _info = whisper_model.transcribe(local_path, word_timestamps=True)
-
         words = []
         for seg in segments:
             for w in seg.words:
@@ -249,7 +234,6 @@ def _run_transcribe(task_id: str, audio_url: str):
                     "start": round(w.start, 3),
                     "end": round(w.end, 3),
                 })
-
         transcribe_tasks[task_id] = {"status": "completed", "words": words}
     except Exception as e:
         transcribe_tasks[task_id] = {"status": "failed", "error": str(e), "words": []}
@@ -291,6 +275,9 @@ class RenderRequest(BaseModel):
     subtitle_words: List[dict]   # [{ "word": "...", "start": 0.1, "end": 0.4 }, ...]
     aspect_ratio: str = "16:9"
     ken_burns: bool = True
+    subtitle_config: dict = {}      # R005 — max_chars / break_on, optional
+    audio_master: dict = {}         # R008 — loudness_lufs / true_peak_dbtp / music_bed, optional
+    safe_zone_bottom: int = 200     # R007 — reserved for future use by visuals.py callers
 
 
 def _format_ass_time(t: float) -> str:
@@ -301,7 +288,9 @@ def _format_ass_time(t: float) -> str:
     return f"{h:d}:{m:02d}:{int(s):02d}.{cs:02d}"
 
 
-def _write_ass(words: List[dict], path: str, w: int, h: int, words_per_chunk: int = 5):
+def _write_ass(words: List[dict], path: str, w: int, h: int,
+               words_per_chunk: int = 5, max_chars: int = 32,
+               phrase_break: bool = True):
     """Writes a self-contained .ass subtitle file with an explicit PlayResX/
     PlayResY matching the actual video frame. This is the fix for the
     'gigantic subtitles' bug: when a plain .srt is burned via ffmpeg's
@@ -310,13 +299,48 @@ def _write_ass(words: List[dict], path: str, w: int, h: int, words_per_chunk: in
     resolution, so the font ends up wildly oversized or undersized. Writing
     the .ass ourselves removes the guesswork entirely: what we declare here
     is exactly what libass renders against.
+
+    R005: chunks break on phrase boundaries and never split a number. Cutting
+    every N words put "$1" on one card and ",000" on the next - and the figure
+    is the whole reason the section exists.
     """
-    chunks, chunk = [], []
-    for word in words:
+    def _joins_number(prev_word, next_word):
+        """True when these two words are two halves of one figure."""
+        a = str(prev_word or "").strip()
+        b = str(next_word or "").strip()
+        # "$1" + ",000"  |  "1" + ",000"  |  "$1,000" + ".50"
+        if re.search(r"\d$", a) and re.match(r"^[,.]\d", b):
+            return True
+        # "twelve" + "hundred" style pairs read as one figure too
+        if re.search(r"\d$", a) and re.match(r"^(hundred|thousand|million|percent|dollars?)\b", b, re.I):
+            return True
+        return False
+
+    def _ends_phrase(word):
+        return bool(re.search(r"[.!?,;:]$", str(word or "").strip()))
+
+    chunks, chunk, chars = [], [], 0
+    for i, word in enumerate(words):
+        token = str(word.get("word", "")).strip()
+        nxt = words[i + 1] if i + 1 < len(words) else None
+
         chunk.append(word)
-        if len(chunk) >= words_per_chunk:
+        chars += len(token) + 1
+
+        if not chunk:
+            continue
+
+        # never cut a figure in half
+        if nxt is not None and _joins_number(token, nxt.get("word")):
+            continue
+
+        full = chars >= max_chars or len(chunk) >= words_per_chunk + 2
+        at_phrase = phrase_break and _ends_phrase(token) and len(chunk) >= 3
+
+        if at_phrase or full:
             chunks.append(chunk)
-            chunk = []
+            chunk, chars = [], 0
+
     if chunk:
         chunks.append(chunk)
 
@@ -325,15 +349,12 @@ ScriptType: v4.00+
 PlayResX: {w}
 PlayResY: {h}
 ScaledBorderAndShadow: yes
-
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,Arial,{int(h * 0.058)},&H0000FFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,3,3,2,{int(w * 0.06)},{int(w * 0.06)},{int(h * 0.14)},1
-
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-
     with open(path, "w", encoding="utf-8") as f:
         f.write(header)
         for c in chunks:
@@ -346,11 +367,9 @@ def _run_render(task_id: str, payload: dict):
     try:
         work_dir = os.path.join(STORAGE_DIR, task_id)
         os.makedirs(work_dir, exist_ok=True)
-
         # --- download voiceover audio ---
         audio_path = os.path.join(work_dir, "audio.mp3")
         download_file(payload["audio_url"], audio_path)
-
         duration = float(subprocess.check_output([
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", audio_path
@@ -398,7 +417,11 @@ def _run_render(task_id: str, payload: dict):
         # --- subtitles file: short bursts, own PlayResX/PlayResY so the font
         # renders at the correct size against this exact frame — no guessing. ---
         ass_path = os.path.join(work_dir, "subs.ass")
-        _write_ass(payload["subtitle_words"], ass_path, w, h, words_per_chunk=5)
+        sc = payload.get("subtitle_config") or {}
+        _write_ass(payload["subtitle_words"], ass_path, w, h,
+                   words_per_chunk=5,
+                   max_chars=int(sc.get("max_chars", 32)),
+                   phrase_break=str(sc.get("break_on", "phrase")) == "phrase")
 
         # Build the gradient overlay once (reused for every segment).
         gradient_path = os.path.join(work_dir, "gradient.png")
@@ -421,7 +444,6 @@ def _run_render(task_id: str, payload: dict):
             seg_path = os.path.join(work_dir, f"seg_{i}.mp4")
             seg_duration = durations[i]
             frames = max(int(seg_duration * fps), fps)
-
             # Camera motion is decided per shot by the caller, not by position.
             # Ken Burns on a chart is the single worst thing you can do to one:
             # it drifts the figures out of frame and makes a clean graphic look
@@ -437,7 +459,6 @@ def _run_render(task_id: str, payload: dict):
             else:
                 chain = f"scale={w}:{h}:force_original_aspect_ratio=decrease," \
                         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=0x0f172a,fps={fps}"
-
             subprocess.run([
                 "ffmpeg", "-y",
                 "-loop", "1", "-i", img_path,
@@ -455,29 +476,62 @@ def _run_render(task_id: str, payload: dict):
         with open(concat_list_path, "w") as f:
             for p in segment_paths:
                 f.write(f"file '{p}'\n")
-
         concat_video_path = os.path.join(work_dir, "concat.mp4")
         subprocess.run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path,
             "-c", "copy", concat_video_path
         ], check=True, capture_output=True)
 
-        # --- add voiceover audio + burn subtitles, bottom-centered over the
-        # gradient. Bold yellow text with a black shadow — all styling is
-        # already baked into the .ass file itself, so no force_style needed. ---
+        # --- add voiceover + music bed, master to broadcast loudness, burn subs ---
+        # R008: the published video peaked at 0.0 dBFS with 271 clipped samples
+        # and sat at -20.4 LUFS. YouTube normalises to -14, so it played quiet
+        # against everything beside it in the sidebar.
         final_path = os.path.join(work_dir, "final.mp4")
-        subprocess.run([
-            "ffmpeg", "-y", "-i", concat_video_path, "-i", audio_path,
-            "-vf", f"ass={ass_path}",
-            "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-shortest", final_path
-        ], check=True, capture_output=True)
+        master = payload.get("audio_master") or {}
+        lufs = float(master.get("loudness_lufs", -14))
+        tp = float(master.get("true_peak_dbtp", -1))
+        want_bed = bool(master.get("music_bed", True))
+
+        bed_path = os.environ.get("MUSIC_BED", os.path.join(_HERE_MAIN, "bed.mp3"))
+        use_bed = want_bed and os.path.exists(bed_path)
+
+        if use_bed:
+            bed_db = float(master.get("music_bed_lufs", -22)) - lufs   # relative to voice
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", concat_video_path,
+                "-i", audio_path,
+                "-stream_loop", "-1", "-i", bed_path,
+                "-filter_complex",
+                f"[2:a]volume={bed_db}dB[bed];"
+                f"[1:a][bed]amix=inputs=2:duration=first:dropout_transition=0[mix];"
+                f"[mix]loudnorm=I={lufs}:TP={tp}:LRA=11[aout]",
+                "-map", "0:v", "-map", "[aout]",
+                "-vf", f"ass={ass_path}",
+                "-c:v", "libx264", "-preset", "veryfast",
+                "-c:a", "aac", "-b:a", "192k",
+                "-shortest", final_path,
+            ]
+        else:
+            # No bed file present - still normalise, still stop the clipping.
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", concat_video_path,
+                "-i", audio_path,
+                "-filter_complex", f"[1:a]loudnorm=I={lufs}:TP={tp}:LRA=11[aout]",
+                "-map", "0:v", "-map", "[aout]",
+                "-vf", f"ass={ass_path}",
+                "-c:v", "libx264", "-preset", "veryfast",
+                "-c:a", "aac", "-b:a", "192k",
+                "-shortest", final_path,
+            ]
+
+        subprocess.run(cmd, check=True, capture_output=True)
 
         final_filename = f"{task_id}_final.mp4"
         final_dest = os.path.join(STORAGE_DIR, final_filename)
         os.replace(final_path, final_dest)
-
         render_tasks[task_id] = {"status": "completed", "video_url": f"{BASE_URL}/files/{final_filename}"}
-
     except subprocess.CalledProcessError as e:
         render_tasks[task_id] = {"status": "failed", "error": e.stderr.decode()[-800:] if e.stderr else str(e)}
     except Exception as e:
@@ -510,7 +564,6 @@ class VisualPreviewRequest(BaseModel):
 @app.post("/visual")
 def visual_preview(req: VisualPreviewRequest):
     """Draw one graphic and return the PNG directly.
-
     Exists so a visual can be checked in a browser in a second, instead of
     waiting ten minutes for a render to find out a label was cut off.
     """
@@ -599,71 +652,49 @@ def storage_usage():
 # credential and POSTs the bytes here; we hand back a plain URL that
 # ffmpeg/ffprobe can fetch with zero friction.
 # Streamed to disk so a 250MB upload never sits in memory.
-from fastapi import Request
-
-
 @app.post("/upload")
 async def upload(request: Request, filename: str = "upload.bin"):
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[-80:]
     stored_name = f"{uuid.uuid4()}_{safe_name}"
     dest_path = os.path.join(STORAGE_DIR, stored_name)
-
     size = 0
     with open(dest_path, "wb") as f:
         async for chunk in request.stream():
             if chunk:
                 f.write(chunk)
                 size += len(chunk)
-
     if size == 0:
         os.remove(dest_path)
         return {"status": "error", "message": "empty upload — no bytes received"}
-
     return {
         "status": "ok",
         "filename": stored_name,
         "bytes": size,
         "file_url": f"{BASE_URL}/files/{stored_name}",
     }
+
+
 # ============================================================
-# ADD TO main.py  ON THE RENDER SERVICE
+# 6. PUBLISH GATE (QC)  — scores a finished video against R001-R012
 # ============================================================
 # qc_gate.py cannot live on the n8n container: Railway wipes the filesystem on
 # every redeploy, and the n8n-ffmpeg image has no Python interpreter. The render
-# service has both Python and ffmpeg, so the gate belongs here as an endpoint.
+# service has both Python and ffmpeg, so the gate lives here as an endpoint.
 #
-# 1. Put qc_gate.py in the n8n-render-service repo, beside main.py
-# 2. Paste the block below into main.py
-# 3. Commit -> Railway redeploys -> done
-#
-# W5's "Run QC Gate" node then calls:
+# W5's "Run QC Gate" node calls:
 #     POST https://n8n-render-service-production.up.railway.app/qc
 #     {"video_url": "...", "meta": {...}}
-
-import os
-import json
-import tempfile
-import urllib.request
-
-from fastapi import HTTPException
-from pydantic import BaseModel
-
-import qc_gate                     # the file you just added to the repo
-
-
 class QCRequest(BaseModel):
     video_url: str
-    meta: dict | None = None       # scenes / metrics / captions from W2 and W3
+    meta: Optional[dict] = None       # scenes / metrics / captions from W2 and W3
 
 
-@app.post("/qc")                   # noqa: F821  (app is defined earlier in main.py)
+@app.post("/qc")
 def run_qc(req: QCRequest):
     """
     Score a finished video against R001-R012.
-
     Returns:
         {"score": 8.6, "blocked": false, "facts": {...}, "rows": [...]}
-
     "blocked" is the only field W5 acts on. Anything true there is written to
     the Finished sheet as QC_FAILED and never reaches the review queue.
     """
@@ -699,7 +730,6 @@ def run_qc(req: QCRequest):
             ],
             "rows": report.rows,
         }
-
     except HTTPException:
         raise
     except Exception as e:
@@ -711,6 +741,7 @@ def run_qc(req: QCRequest):
                 os.unlink(tmp)
             except OSError:
                 pass
+
 
 @app.get("/")
 def health():
