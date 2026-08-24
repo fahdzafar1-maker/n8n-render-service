@@ -14,8 +14,25 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import visuals
-import qc_gate
+
+# --- local modules, loaded defensively -------------------------------------
+# A missing or broken local module must NOT stop the whole service from
+# booting. If it did, one bad file takes down /tts, /render, /transcribe and
+# everything else with it, and Railway shows only "Crashed" with no clue why.
+# Instead we record the failure and report it on the health endpoint.
+_MODULE_ERRORS = {}
+
+try:
+    import visuals
+except Exception as _e:
+    visuals = None
+    _MODULE_ERRORS["visuals"] = f"{type(_e).__name__}: {_e}"
+
+try:
+    import qc_gate
+except Exception as _e:
+    qc_gate = None
+    _MODULE_ERRORS["qc_gate"] = f"{type(_e).__name__}: {_e}"
 
 app = FastAPI(title="Calm Drama Stories - Render Service")
 
@@ -401,6 +418,11 @@ def _run_render(task_id: str, payload: dict):
             img_path = os.path.join(work_dir, f"img_{i}.png")
             spec = img.get("visual_spec")
             if spec:
+                if visuals is None:
+                    raise RuntimeError(
+                        "visuals module failed to import: "
+                        + _MODULE_ERRORS.get("visuals", "unknown")
+                    )
                 visuals.render_png(spec, img_path)
             else:
                 download_file(img["image_url"], img_path)
@@ -567,6 +589,9 @@ def visual_preview(req: VisualPreviewRequest):
     Exists so a visual can be checked in a browser in a second, instead of
     waiting ten minutes for a render to find out a label was cut off.
     """
+    if visuals is None:
+        raise HTTPException(500, "visuals module failed to import: "
+                                 + _MODULE_ERRORS.get("visuals", "unknown"))
     tmp = os.path.join(STORAGE_DIR, f"preview_{uuid.uuid4()}.png")
     try:
         visuals.render_png(req.spec, tmp)
@@ -698,6 +723,9 @@ def run_qc(req: QCRequest):
     "blocked" is the only field W5 acts on. Anything true there is written to
     the Finished sheet as QC_FAILED and never reaches the review queue.
     """
+    if qc_gate is None:
+        raise HTTPException(503, "qc gate unavailable: "
+                                 + _MODULE_ERRORS.get("qc_gate", "qc_gate.py not found in repo"))
     tmp = None
     try:
         # The video may be a local /files/ path or a full URL. Handle both.
@@ -745,4 +773,20 @@ def run_qc(req: QCRequest):
 
 @app.get("/")
 def health():
-    return {"status": "ok"}
+    """Health check that actually tells you something.
+
+    If a local module failed to import, the service still runs — this endpoint
+    names the file and the exact error, so a broken deploy is one curl away
+    from being diagnosed instead of a silent "Crashed" in the dashboard.
+    """
+    return {
+        "status": "ok" if not _MODULE_ERRORS else "degraded",
+        "modules": {
+            "visuals": "ok" if visuals is not None else _MODULE_ERRORS.get("visuals"),
+            "qc_gate": "ok" if qc_gate is not None else _MODULE_ERRORS.get("qc_gate"),
+        },
+        "music_bed": os.path.exists(
+            os.environ.get("MUSIC_BED", os.path.join(_HERE_MAIN, "bed.mp3"))
+        ),
+        "pexels_key": bool(os.environ.get("PEXELS_API_KEY")),
+    }
