@@ -124,6 +124,150 @@ def download_file(url: str, dest_path: str, timeout: int = 600):
         )
 
 
+
+# ============================================================
+# MUSIC BED  — validated, and generated if it is missing
+# ============================================================
+# A render died with "Failed to find two consecutive MPEG audio frames" on
+# /app/bed.mp3. The file was present but not decodable - it had been mangled
+# somewhere between being downloaded and being committed. Forty minutes of
+# rendering was lost to a decorative audio track.
+#
+# Two changes follow from that:
+#   1. The bed is probed before use. Anything ffmpeg cannot open is ignored,
+#      and the render continues without it.
+#   2. If no usable bed exists, one is synthesised here with ffmpeg. There is
+#      then no file to download, upload, or corrupt.
+#
+# The generated bed: Am - F - C - Am, 45s per chord with 5s crossfades, and a
+# plucked note every 3 seconds. Every frequency is a multiple of 0.05 Hz, so
+# 180 seconds is a whole number of cycles for each one and the file loops with
+# no click and no dip at the join.
+
+_BED_CACHE = os.path.join(STORAGE_DIR, "_generated_bed.mp3")
+
+
+def _bed_is_playable(path: str) -> bool:
+    """True only if ffmpeg can actually decode it. Existence is not enough."""
+    if not path or not os.path.exists(path) or os.path.getsize(path) < 10000:
+        return False
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type:format=duration",
+             "-of", "default=nw=1:nk=1", path],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return False
+        out = r.stdout.decode("utf-8", "replace")
+        if "audio" not in out:
+            return False
+        # A badly truncated file can still present a readable header. Looping a
+        # two-second fragment under a seven-minute video is worse than no bed.
+        for tok in out.split():
+            try:
+                if float(tok) >= 5.0:
+                    return True
+            except ValueError:
+                continue
+        return False
+    except Exception:
+        return False
+
+
+def _generate_bed(dest: str) -> bool:
+    """Synthesise the ambient bed. Returns True if dest is now playable."""
+    m = "mod(t\,60)"
+    am = f"(clip((15-{m})/2\,0\,1)+clip(({m}-45)/2\,0\,1))"
+    fg = f"(clip(({m}-13)/2\,0\,1)*clip((30-{m})/2\,0\,1))"
+    cg = f"(clip(({m}-28)/2\,0\,1)*clip((45-{m})/2\,0\,1))"
+
+    def pluck(offset):
+        return (f"(0.08+1.0*clip(mod(t-{offset}\,12)/0.10\,0\,1)"
+                f"*exp(-mod(t-{offset}\,12)/1.3))")
+
+    p0, p3, p6, p9 = pluck(0), pluck(3), pluck(6), pluck(9)
+    notes = [
+        (220, 0.30, am, p0), (261.65, 0.30, am, p3),
+        (329.65, 0.28, am, p6), (440, 0.18, am, p9),
+        (174.60, 0.28, fg, p0), (220, 0.30, fg, p3),
+        (261.65, 0.28, fg, p6), (349.20, 0.20, fg, p9),
+        (261.65, 0.30, cg, p0), (329.65, 0.28, cg, p3),
+        (392, 0.26, cg, p6), (523.25, 0.16, cg, p9),
+    ]
+    cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+    for freq, _, _, _ in notes:
+        cmd += ["-f", "lavfi", "-i", f"sine=frequency={freq}:duration=180:sample_rate=48000"]
+    parts, labels = [], []
+    for i, (_, vol, gate, pk) in enumerate(notes):
+        parts.append(f"[{i}:a]volume='{vol}*{gate}*{pk}':eval=frame[n{i}]")
+        labels.append(f"[n{i}]")
+    parts.append("".join(labels) + f"amix=inputs={len(notes)}:normalize=0[mix]")
+    parts.append("[mix]lowpass=f=3200,aformat=channel_layouts=stereo[out]")
+
+    raw = dest + ".raw.wav"
+    cmd += ["-filter_complex", ";".join(parts), "-map", "[out]",
+            "-c:a", "pcm_s16le", raw]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+
+        # Measure, then apply the exact correction. A hard-coded gain was wrong
+        # by 36 dB the first time it was written; the file has to be measured.
+        # A fixed gain, not loudnorm: loudnorm varies the gain over time, which
+        # would leave a step at the loop point.
+        meas = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", raw, "-af", "ebur128",
+             "-f", "null", "-"],
+            capture_output=True, timeout=300,
+        ).stderr.decode("utf-8", "replace")
+
+        current = None
+        for line in meas.splitlines():
+            t = line.strip()
+            if t.startswith("I:") and "LUFS" in t:
+                try:
+                    current = float(t.split()[1])
+                except (ValueError, IndexError):
+                    pass
+        gain = 0.0 if current is None else round(-22.0 - current, 2)
+        gain = max(-40.0, min(40.0, gain))
+
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", raw,
+             "-af", f"volume={gain}dB",
+             "-c:a", "libmp3lame", "-b:a", "160k", "-ar", "48000", dest],
+            check=True, capture_output=True, timeout=300,
+        )
+    except Exception:
+        for p in (dest, raw):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        return False
+    finally:
+        if os.path.exists(raw):
+            try:
+                os.remove(raw)
+            except OSError:
+                pass
+    return _bed_is_playable(dest)
+
+
+def resolve_bed() -> Optional[str]:
+    """The bed to mix in, or None if there should not be one."""
+    supplied = os.environ.get("MUSIC_BED", os.path.join(_HERE_MAIN, "bed.mp3"))
+    if _bed_is_playable(supplied):
+        return supplied
+    if _bed_is_playable(_BED_CACHE):
+        return _BED_CACHE
+    if _generate_bed(_BED_CACHE):
+        return _BED_CACHE
+    return None
+
+
 # ============================================================
 # 1. TEXT-TO-SPEECH  (Kokoro-82M, self-hosted, free)
 # ============================================================
@@ -514,8 +658,10 @@ def _run_render(task_id: str, payload: dict):
         tp = float(master.get("true_peak_dbtp", -1))
         want_bed = bool(master.get("music_bed", True))
 
-        bed_path = os.environ.get("MUSIC_BED", os.path.join(_HERE_MAIN, "bed.mp3"))
-        use_bed = want_bed and os.path.exists(bed_path)
+        # resolve_bed() probes the file and falls back to a generated one, so a
+        # missing or corrupt bed can never take the render down with it.
+        bed_path = resolve_bed() if want_bed else None
+        use_bed = bool(bed_path)
 
         if use_bed:
             # Default -42 => -28 dB on the bed, which measures about 20 dB under
@@ -775,6 +921,26 @@ def run_qc(req: QCRequest):
                 pass
 
 
+def _bed_describe():
+    """What the health endpoint reports: which bed is in play, and why.
+
+    Plain existence was misleading - it said true for a file ffmpeg could not
+    open, so the render still failed after reporting healthy.
+    """
+    supplied = os.environ.get("MUSIC_BED", os.path.join(_HERE_MAIN, "bed.mp3"))
+    if os.path.exists(supplied):
+        size = os.path.getsize(supplied)
+        if _bed_is_playable(supplied):
+            return {"source": "supplied", "path": supplied, "bytes": size, "ok": True}
+        return {"source": "supplied", "path": supplied, "bytes": size, "ok": False,
+                "note": "file present but ffmpeg cannot decode it - a generated bed "
+                        "is used instead. Re-upload it, or just leave it: the "
+                        "generated one is the same music."}
+    if _bed_is_playable(_BED_CACHE):
+        return {"source": "generated", "path": _BED_CACHE, "ok": True}
+    return {"source": "generated-on-first-render", "ok": True}
+
+
 @app.get("/")
 def health():
     """Health check that actually tells you something.
@@ -789,8 +955,6 @@ def health():
             "visuals": "ok" if visuals is not None else _MODULE_ERRORS.get("visuals"),
             "qc_gate": "ok" if qc_gate is not None else _MODULE_ERRORS.get("qc_gate"),
         },
-        "music_bed": os.path.exists(
-            os.environ.get("MUSIC_BED", os.path.join(_HERE_MAIN, "bed.mp3"))
-        ),
+        "music_bed": _bed_describe(),
         "pexels_key": bool(os.environ.get("PEXELS_API_KEY")),
     }
