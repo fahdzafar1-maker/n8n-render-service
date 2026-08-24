@@ -518,7 +518,11 @@ def _run_render(task_id: str, payload: dict):
         use_bed = want_bed and os.path.exists(bed_path)
 
         if use_bed:
-            bed_db = float(master.get("music_bed_lufs", -22)) - lufs   # relative to voice
+            # Default -42 => -28 dB on the bed, which measures about 20 dB under
+            # the voice in the finished file: felt, not heard. The old default of
+            # -22 left it only 5.5 dB down, where the music competes with the
+            # narration instead of supporting it.
+            bed_db = float(master.get("music_bed_lufs", -42)) - lufs   # relative to voice
             cmd = [
                 "ffmpeg", "-y",
                 "-i", concat_video_path,
