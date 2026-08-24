@@ -524,6 +524,60 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f.write(f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Default,,0,0,0,,{text}\n")
 
 
+
+# AAC encoding pushes the true peak back up by a few tenths of a dB, so the
+# limiter has to aim below the target or the finished file lands over the line.
+# Measured through the real chain (loudnorm -> alimiter -> aac 192k):
+#     0.0 dB headroom -> -0.85 dBTP, 29 clipped samples   fails R008c
+#     0.5 dB          -> -1.31 dBTP, 0 clipped            passes
+#     1.0 dB          -> -1.69 dBTP, 0 clipped            passes, with margin
+#     2.0 dB          -> -2.86 dBTP, 0 clipped            quieter than it needs
+_CODEC_HEADROOM_DB = 1.0
+
+
+def _lim(tp_db: float) -> float:
+    """Linear amplitude for alimiter's `limit`, with codec headroom."""
+    return round(10 ** ((float(tp_db) - _CODEC_HEADROOM_DB) / 20.0), 4)
+
+
+def _audio_report(path: str) -> dict:
+    """Measure the finished file and say what the audio actually came out as.
+
+    A render was rejected by the QC gate for 1889 clipped samples and +3.1 dBTP
+    on a file that had supposedly been through loudnorm. There was no way to
+    tell from the outside whether the mastering had run at all, so the next step
+    was a twenty-minute re-render to find out. The service now reports its own
+    work instead.
+    """
+    rep = {}
+    try:
+        v = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", path,
+             "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, timeout=600,
+        ).stderr.decode("utf-8", "replace")
+        m = re.search(r"max_volume:\s*(-?[\d.]+) dB", v)
+        if m:
+            rep["max_dbfs"] = float(m.group(1))
+        m = re.search(r"histogram_0db:\s*(\d+)", v)
+        rep["clipped_samples"] = int(m.group(1)) if m else 0
+
+        l = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", path,
+             "-af", "loudnorm=I=-14:TP=-1:print_format=json", "-f", "null", "-"],
+            capture_output=True, timeout=600,
+        ).stderr.decode("utf-8", "replace")
+        m = re.search(r'"input_i"\s*:\s*"(-?[\d.]+)"', l)
+        if m:
+            rep["lufs"] = float(m.group(1))
+        m = re.search(r'"input_tp"\s*:\s*"(-?[\d.]+)"', l)
+        if m:
+            rep["true_peak_dbtp"] = float(m.group(1))
+    except Exception as e:
+        rep["error"] = str(e)[:200]
+    return rep
+
+
 def _run_render(task_id: str, payload: dict):
     try:
         work_dir = os.path.join(STORAGE_DIR, task_id)
@@ -677,7 +731,8 @@ def _run_render(task_id: str, payload: dict):
                 "-filter_complex",
                 f"[2:a]volume={bed_db}dB[bed];"
                 f"[1:a][bed]amix=inputs=2:duration=first:dropout_transition=0[mix];"
-                f"[mix]loudnorm=I={lufs}:TP={tp}:LRA=11[aout]",
+                f"[mix]loudnorm=I={lufs}:TP={tp}:LRA=11,"
+                f"alimiter=limit={_lim(tp)}:attack=5:release=50:level=disabled[aout]",
                 "-map", "0:v", "-map", "[aout]",
                 "-vf", f"ass={ass_path}",
                 "-c:v", "libx264", "-preset", "veryfast",
@@ -690,7 +745,9 @@ def _run_render(task_id: str, payload: dict):
                 "ffmpeg", "-y",
                 "-i", concat_video_path,
                 "-i", audio_path,
-                "-filter_complex", f"[1:a]loudnorm=I={lufs}:TP={tp}:LRA=11[aout]",
+                "-filter_complex",
+                f"[1:a]loudnorm=I={lufs}:TP={tp}:LRA=11,"
+                f"alimiter=limit={_lim(tp)}:attack=5:release=50:level=disabled[aout]",
                 "-map", "0:v", "-map", "[aout]",
                 "-vf", f"ass={ass_path}",
                 "-c:v", "libx264", "-preset", "veryfast",
@@ -703,7 +760,23 @@ def _run_render(task_id: str, payload: dict):
         final_filename = f"{task_id}_final.mp4"
         final_dest = os.path.join(STORAGE_DIR, final_filename)
         os.replace(final_path, final_dest)
-        render_tasks[task_id] = {"status": "completed", "video_url": f"{BASE_URL}/files/{final_filename}"}
+
+        render_tasks[task_id] = {
+            "status": "completed",
+            "video_url": f"{BASE_URL}/files/{final_filename}",
+            # What the audio path actually did, measured on the output file.
+            "audio": {
+                "mastered": True,
+                "target_lufs": lufs,
+                "target_dbtp": tp,
+                "limiter": True,
+                "music_bed": bed_path or None,
+                "bed_gain_db": (bed_db if use_bed else None),
+                "measured": _audio_report(final_dest),
+            },
+            "shots": len(image_paths),
+            "duration_seconds": round(duration, 1),
+        }
     except subprocess.CalledProcessError as e:
         render_tasks[task_id] = {"status": "failed", "error": e.stderr.decode()[-800:] if e.stderr else str(e)}
     except Exception as e:
