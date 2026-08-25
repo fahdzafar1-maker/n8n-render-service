@@ -477,8 +477,19 @@ def _write_ass(words: List[dict], path: str, w: int, h: int,
             return True
         return False
 
-    def _ends_phrase(word):
-        return bool(re.search(r"[.!?,;:]$", str(word or "").strip()))
+    def _ends_sentence(word):
+        return bool(re.search(r"[.!?]$", str(word or "").strip()))
+
+    def _ends_clause(word):
+        return bool(re.search(r"[,;:]$", str(word or "").strip()))
+
+    # A card should never end on one of these. "AND PROPERTY TAX IS ONE LINE ON"
+    # leaves the reader hanging on a preposition; the word belongs with what
+    # follows it.
+    _DANGLING = set((
+        "a an the and or but of to in on at by for from with as is are was were "
+        "that this it its his her their our your my than then so if when while"
+    ).split())
 
     chunks, chunk, chars = [], [], 0
     for i, word in enumerate(words):
@@ -495,15 +506,62 @@ def _write_ass(words: List[dict], path: str, w: int, h: int,
         if nxt is not None and _joins_number(token, nxt.get("word")):
             continue
 
-        full = chars >= max_chars or len(chunk) >= words_per_chunk + 2
-        at_phrase = phrase_break and _ends_phrase(token) and len(chunk) >= 3
-
-        if at_phrase or full:
+        # A sentence end ALWAYS ends the card, however short it is.
+        #
+        # This used to require three words first, so a two-word sentence could
+        # not close a card and the next sentence ran on into it:
+        #     "TWENTY-SEVEN THIRTY A YEAR IN PROPERTY"
+        #     "TAX. SO DOES MOVING SOUTH REALLY"
+        # - one card carrying the tail of one sentence and the head of the
+        # next, with "PROPERTY TAX" torn in half across the join.
+        if phrase_break and _ends_sentence(token):
             chunks.append(chunk)
             chunk, chars = [], 0
+            continue
+
+        at_clause = phrase_break and _ends_clause(token) and (len(chunk) >= 3 or chars >= 20)
+        full = chars >= max_chars or len(chunk) >= words_per_chunk + 2
+
+        if at_clause or full:
+            # do not leave the card hanging on a function word
+            if (full and not at_clause and len(chunk) > 2
+                    and token.lower().strip(".,;:!?") in _DANGLING):
+                held = chunk.pop()
+                chunks.append(chunk)
+                chunk = [held]
+                chars = len(str(held.get("word", "")).strip()) + 1
+            else:
+                chunks.append(chunk)
+                chunk, chars = [], 0
 
     if chunk:
         chunks.append(chunk)
+
+    # ---- merge the orphans ------------------------------------------------
+    # Cutting at max_chars can land inside a noun phrase and leave a card
+    # holding almost nothing: "...A YEAR IN PROPERTY" followed by a card that
+    # reads only "TAX." Four characters is not a subtitle, it is a flicker.
+    #
+    # Rather than encode grammar, anything too small to be worth its own card
+    # is folded back into the neighbour it reads with - preferring the card it
+    # came from, and only when the merged card stays a comfortable length.
+    def _len(c):
+        return sum(len(str(w.get("word", "")).strip()) + 1 for w in c) - 1
+
+    MIN_CARD = 14
+    MERGE_CEILING = max_chars + 12
+    merged = []
+    for c in chunks:
+        if (merged and _len(c) < MIN_CARD
+                and _len(merged[-1]) + _len(c) + 1 <= MERGE_CEILING):
+            merged[-1] = merged[-1] + c
+        else:
+            merged.append(c)
+    # a tiny FIRST card has no previous neighbour, so it joins the next one
+    if len(merged) > 1 and _len(merged[0]) < MIN_CARD and _len(merged[0]) + _len(merged[1]) + 1 <= MERGE_CEILING:
+        merged[1] = merged[0] + merged[1]
+        merged.pop(0)
+    chunks = merged
 
     header = f"""[Script Info]
 ScriptType: v4.00+
