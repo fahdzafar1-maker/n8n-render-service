@@ -52,7 +52,29 @@ def probe_duration(path):
     except ValueError:
         sys.exit(f"[!] ffprobe fail: {path}")
 
-def scene_cuts(path, thresh=0.2):
+# 0.2 was borrowed from generic film-cut detection and is far too high for a
+# design system that keeps the same dark background on every card. Measured on
+# fifteen genuinely different cards from visuals.py, the frame-to-frame scores
+# at a real cut sit between 0.076 and 0.083:
+#
+#     threshold 0.2  ->  0 of 14 cuts found
+#     threshold 0.1  ->  0 of 14
+#     threshold 0.06 -> 14 of 14
+#
+# Re-measured against a full 6:49 render carrying Ken Burns motion, the caption
+# gradient and burned-in subtitles, which soften a cut further:
+#     threshold 0.10 -> 20 of 71 real cuts
+#     threshold 0.06 -> 69 of 71
+#     threshold 0.04 -> 71 of 71, with 2 spurious      <- this
+#     threshold 0.02 -> 71 of 71, with 42 spurious
+#
+# At 0.2 the gate reported 51 cuts in a video that had 73, and called a
+# correctly-paced video a 6.7s slideshow. A slow Ken Burns drift moves the
+# frame by far less than 0.06 between frames, so it is not mistaken for a cut.
+SCENE_THRESHOLD = 0.04
+
+
+def scene_cuts(path, thresh=SCENE_THRESHOLD):
     """Hard cut timestamps."""
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
         meta = f.name
@@ -66,15 +88,33 @@ def scene_cuts(path, thresh=0.2):
     return sorted(cuts)
 
 def layout_signatures(path, every=2.0):
-    """Frames ko 16x9 gray me girakar duplicate layouts count karta hai."""
+    """A perceptual signature per sampled frame, used to spot repeated layouts.
+
+    The old version dropped each frame to 16x9 and thresholded every cell at a
+    FIXED luma of 110. On this channel's palette that is close to useless: the
+    background sits around luma 20, so nearly every cell reads as 0 and quite
+    different cards collapse onto the same signature.
+
+    Measured on a real 6:49 render containing 42 genuinely different images:
+
+        16x9,  fixed 110   ->  10 distinct, biggest group 75% of runtime
+        16x9,  mean        ->  71 distinct, biggest group  6%
+        32x18, mean        -> 105 distinct, biggest group  5%   <- this
+        48x27, mean        -> 109 distinct, biggest group  5%
+
+    It reported a correctly varied video as 75% one layout. Thresholding each
+    frame against its OWN mean brightness, at 32x18, measures what it claims to.
+    """
     d = tempfile.mkdtemp()
-    sh(f'ffmpeg -v error -i "{path}" -vf "fps=1/{every},crop=1920:700:0:100,scale=16:9" '
+    sh(f'ffmpeg -v error -i "{path}" -vf "fps=1/{every},crop=1920:700:0:100,scale=32:18" '
        f'-pix_fmt gray {d}/h_%05d.pgm -y')
     sigs = []
     for fp in sorted(glob.glob(f"{d}/h_*.pgm")):
         raw = open(fp, "rb").read().split(b"\n", 3)
         px = raw[3] if len(raw) > 3 else b""
-        sigs.append(tuple(1 if b > 110 else 0 for b in px))
+        if px:
+            mean = sum(px) / len(px)
+            sigs.append(tuple(1 if b > mean else 0 for b in px))
         os.unlink(fp)
     os.rmdir(d)
     return sigs
