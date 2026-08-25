@@ -313,10 +313,13 @@ def flag_vs(a, b, title=None, sub_a=None, sub_b=None, eyebrow=None):
             'font-weight="bold" text-anchor="middle">%s</text>'
             % (cx, cy + fh / 2 + 108, INK, FONT, size, esc(name)))
         if sub:
+            # These carry the hook figure on the title card, so they are set as
+            # figures - in the entity's own colour, at a size a viewer reads in
+            # the first second - not as grey small print under the name.
             parts.append(
-                '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="42" '
-                'text-anchor="middle">%s</text>'
-                % (cx, cy + fh / 2 + 172, MUTED, FONT, esc(sub)))
+                '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="72" '
+                'font-weight="bold" text-anchor="middle">%s</text>'
+                % (cx, cy + fh / 2 + 184, colour, FONT, esc(sub)))
     parts.append(
         '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="62" '
         'font-weight="bold" text-anchor="middle">vs</text>'
@@ -506,27 +509,57 @@ def big_stat(value, caption=None, title=None, colour=ACCENT,
     under the headline number.
     """
     parts = []
+
+    # Did we actually get a photograph? This matters more than it looks.
+    #
+    # photo_stat and big_stat are the same function; only photo_query differs.
+    # When the photo could not be fetched the two rendered BYTE-IDENTICAL, so a
+    # sequence built to alternate between them showed one unchanging picture -
+    # measured as an 18.7-second static hold, with the cuts between the pieces
+    # invisible to scene detection.
+    #
+    # A missing photo must still produce a different card, so the layout shifts:
+    # the figure moves off-centre against an accent rule instead of sitting
+    # dead centre. Nothing depends on the network to stay visually distinct.
+    layer = None
     if photo_query:
         layer = _photo_layer(photo_query, 0, 0, W, H, scrim="full", clip_id="bs")
         if layer:
             parts.append(layer)
+    # _photo_layer returns "" when there is no photo, not None. Testing for
+    # None meant the fallback layout never triggered and the two cards stayed
+    # byte-identical - the bug this whole branch exists to prevent.
+    offset = bool(photo_query) and not layer
 
     parts.append(_eyebrow(eyebrow))
     parts.append(_title(title, 130))
 
     size = fit(value, 260, W - 320, 90)
-    parts.append(
-        '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="%d" '
-        'font-weight="bold" text-anchor="middle">%s</text>'
-        % (W // 2, 520, colour, FONT, size, esc(value)))
+    if offset:
+        parts.append('<rect x="140" y="368" width="12" height="210" fill="%s" rx="6"/>'
+                     % colour)
+        parts.append(
+            '<text x="196" y="%d" fill="%s" font-family="%s" font-size="%d" '
+            'font-weight="bold">%s</text>'
+            % (540, colour, FONT, min(size, 230), esc(value)))
+    else:
+        parts.append(
+            '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="%d" '
+            'font-weight="bold" text-anchor="middle">%s</text>'
+            % (W // 2, 520, colour, FONT, size, esc(value)))
 
     y = 640
     if caption:
         for i, ln in enumerate(wrap(caption, 34, 2)):
-            parts.append(
-                '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="56" '
-                'text-anchor="middle">%s</text>'
-                % (W // 2, y + i * 74, INK, FONT, esc(ln)))
+            if offset:
+                parts.append(
+                    '<text x="196" y="%d" fill="%s" font-family="%s" font-size="52">%s</text>'
+                    % (y + i * 74, INK, FONT, esc(ln)))
+            else:
+                parts.append(
+                    '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="56" '
+                    'text-anchor="middle">%s</text>'
+                    % (W // 2, y + i * 74, INK, FONT, esc(ln)))
         y += 74 * len(wrap(caption, 34, 2))
 
     if context_a and context_b:
@@ -545,8 +578,9 @@ def big_stat(value, caption=None, title=None, colour=ACCENT,
             'font-weight="bold">%s</text>'
             % (W // 2 + 46, ay, COOL, FONT, esc(b_txt)))
 
-    parts.append('<rect x="%d" y="%d" width="220" height="8" fill="%s" rx="4"/>'
-                 % (W // 2 - 110, 300, colour))
+    if not offset:
+        parts.append('<rect x="%d" y="%d" width="220" height="8" fill="%s" rx="4"/>'
+                     % (W // 2 - 110, 300, colour))
     return _open() + "".join(parts) + "</svg>"
 
 
