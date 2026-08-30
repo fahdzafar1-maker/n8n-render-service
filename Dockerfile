@@ -17,7 +17,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     shared-mime-info \
     fonts-dejavu-core \
+    fonts-roboto \
  && rm -rf /var/lib/apt/lists/*
+
+# fonts-roboto is for the thumbnails. Without it the image has only DejaVu,
+# thumbnail.py silently falls back to it, and the layout is measured against
+# one face while cairosvg draws another - text that fitted locally runs off
+# the frame on Railway. /  reports "thumbnail_font" so the deployed face can
+# be confirmed rather than assumed.
 
 RUN pip install --no-cache-dir -r requirements.txt
 
