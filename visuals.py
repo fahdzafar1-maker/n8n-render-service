@@ -1,113 +1,122 @@
+"""Thumbnail generator for the Price & Power channel.
+
+Written to the channel owner's brief, which replaced an earlier version of
+this file that was rejected - correctly. That version drew dark navy cards
+with a metric eyebrow, two state names, two values, a gap pill and a verdict
+bar: six elements, a chart rather than a thumbnail, and its hook line
+("THE CHEAPER HOME LOSES") answered the question on the image, so there was
+nothing left to click for.
+
+The brief, applied here:
+
+  ONE CONFLICT PER FRAME.        Two subjects, two numbers, one hook. Nothing else.
+  SHOW THE PROBLEM, HIDE THE     The hook poses a question. It never names the
+  ANSWER.                        winner and never restates the title.
+  PHOTOREAL, CINEMATIC, SIMPLE.  Real photographs, graded warm against cool so
+                                 the two sides separate instantly.
+  HIERARCHY.                     number -> which side is which -> hook.
+  NO TITLE DUPLICATION.          The title carries the detail; the image takes
+                                 the attention. So no metric label on the frame.
+
+Engineering constraints, unchanged:
+  - Railway has no Chromium, so this is SVG rasterised by cairosvg, the same
+    path visuals.py uses in production.
+  - Text is MEASURED against the real font file through PIL and shrunk to fit;
+    a character-count estimate puts 170px type off the edge of the frame.
+  - Nothing below MIN_TEXT. At a 120px-wide preview - the true size in a phone
+    feed - smaller elements dissolve into mush.
 """
-visuals.py — the visual engine.
 
-One design language for every graphic in the video: dark navy field, one amber
-accent, white type. Everything is drawn as SVG and rasterised with cairosvg, so
-there is no browser dependency and no external chart service deciding what our
-graphics look like.
-
-Layout rule that governs all of it: the bottom 20% of the frame belongs to the
-subtitles. Nothing that carries meaning is drawn there, so captions never sit
-on top of a number.
-
-------------------------------------------------------------------------------
-v2 — changes made under the QC policy (R002, R006, R011)
-
-R002  bar_pair is now HORIZONTAL and thin. It used to draw two vertical columns
-      330px wide and up to ~450px tall, which read as heavy blocks rather than
-      a measurement. Bars are now 56px high and up to 1200px long, with the
-      figure sitting just past the end of its own bar. Long and thin.
-
-R002  big_stat can carry context_a / context_b. A gap shown on its own is
-      meaningless: "$81" tells a viewer nothing without "$1,931 vs $1,850"
-      underneath it. The published video showed "$4" and "$81" floating alone.
-
-R011  Three photograph types added — photo_full, photo_stat, photo_split. The
-      published video contained zero photographs across 7:47, and one single
-      layout occupied 36% of its runtime. Photos come from Pexels (free, no
-      per-image cost) and are cached on disk, so a repeated query is fetched
-      once. With no PEXELS_API_KEY set they degrade to the normal card rather
-      than failing the render.
-
-R006  Every card accepts an "eyebrow": a short category label above the title.
-      It is drawn from the spec and never derived from the headline. The old
-      cards showed "ADDS UP" sitting above "Every Small Fee Adds Up".
-
-Everything else — the palette, the flag fetching, the US map, the state-shape
-fallback, statement, tally, and render_png itself — is unchanged.
-------------------------------------------------------------------------------
-"""
-import os
-import json
-import math
 import base64
 import hashlib
-import requests
+import os
+import re
+
+try:
+    from PIL import ImageFont
+except Exception:                                    # pragma: no cover
+    ImageFont = None
+
+try:
+    import requests
+except Exception:                                    # pragma: no cover
+    requests = None
+
 import cairosvg
 
-# ---------------------------------------------------------------- palette
-BG      = "#0f172a"
-PANEL   = "#1e293b"
-INK     = "#f8fafc"
-MUTED   = "#94a3b8"
-ACCENT  = "#f59e0b"   # side A / the highlighted thing
-COOL    = "#3b82f6"   # side B
-DIM     = "#334155"   # everything not being talked about
+W, H = 1280, 720
 
-W, H = 1920, 1080
-SAFE_H = int(H * 0.80)          # subtitles own everything below this
-FONT = "DejaVu Sans, Arial, Helvetica, sans-serif"
+INK = "#ffffff"
+SHADE = "#080d16"          # the dark used for scrims, never as a flat ground
+WARM = "#ff9d2e"           # left-side grade
+COOL = "#3f9bff"           # right-side grade
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_US_PATHS = None
-_FLAG_CACHE = {}
-_PHOTO_CACHE = {}
-PHOTO_DIR = os.environ.get("PHOTO_CACHE_DIR", "/data/storage/_photos")
+MIN_TEXT = 56              # unreadable below this in a phone feed
+BADGE = (1112, 656, 1272, 712)      # YouTube stamps the duration here
 
-# US state and territory postal codes, for flagcdn (us-tx, us-wa ...)
-STATE_CODES = {
-    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar",
-    "california": "ca", "colorado": "co", "connecticut": "ct", "delaware": "de",
-    "florida": "fl", "georgia": "ga", "hawaii": "hi", "idaho": "id",
-    "illinois": "il", "indiana": "in", "iowa": "ia", "kansas": "ks",
-    "kentucky": "ky", "louisiana": "la", "maine": "me", "maryland": "md",
-    "massachusetts": "ma", "michigan": "mi", "minnesota": "mn",
-    "mississippi": "ms", "missouri": "mo", "montana": "mt", "nebraska": "ne",
-    "nevada": "nv", "new hampshire": "nh", "new jersey": "nj",
-    "new mexico": "nm", "new york": "ny", "north carolina": "nc",
-    "north dakota": "nd", "ohio": "oh", "oklahoma": "ok", "oregon": "or",
-    "pennsylvania": "pa", "rhode island": "ri", "south carolina": "sc",
-    "south dakota": "sd", "tennessee": "tn", "texas": "tx", "utah": "ut",
-    "vermont": "vt", "virginia": "va", "washington": "wa",
-    "west virginia": "wv", "wisconsin": "wi", "wyoming": "wy",
-    "district of columbia": "dc",
-}
+PHOTO_DIR = os.environ.get("PHOTO_CACHE_DIR", "/tmp/thumb_photos")
+try:
+    os.makedirs(PHOTO_DIR, exist_ok=True)
+except Exception:
+    pass
 
-COUNTRY_CODES = {
-    "united states": "us", "usa": "us", "america": "us",
-    "united kingdom": "gb", "uk": "gb", "britain": "gb", "england": "gb",
-    "canada": "ca", "australia": "au", "new zealand": "nz", "ireland": "ie",
-    "germany": "de", "france": "fr", "spain": "es", "portugal": "pt",
-    "italy": "it", "netherlands": "nl", "belgium": "be", "switzerland": "ch",
-    "austria": "at", "sweden": "se", "norway": "no", "denmark": "dk",
-    "finland": "fi", "poland": "pl", "czechia": "cz", "czech republic": "cz",
-    "greece": "gr", "japan": "jp", "south korea": "kr", "korea": "kr",
-    "china": "cn", "india": "in", "pakistan": "pk", "singapore": "sg",
-    "malaysia": "my", "thailand": "th", "indonesia": "id",
-    "united arab emirates": "ae", "uae": "ae", "dubai": "ae",
-    "saudi arabia": "sa", "qatar": "qa", "kuwait": "kw", "turkey": "tr",
-    "mexico": "mx", "brazil": "br", "argentina": "ar", "chile": "cl",
-    "colombia": "co", "south africa": "za", "egypt": "eg", "nigeria": "ng",
-    "kenya": "ke", "israel": "il", "russia": "ru", "ukraine": "ua",
-}
+_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Black.ttf",
+    "/usr/share/fonts/truetype/roboto/unhinted/RobotoCondensed-Bold.ttf",
+    "/usr/share/fonts/truetype/roboto/Roboto-Black.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
 
 
-def _load_paths():
-    global _US_PATHS
-    if _US_PATHS is None:
-        with open(os.path.join(_HERE, "us_paths.json")) as f:
-            _US_PATHS = json.load(f)
-    return _US_PATHS
+def _font_path():
+    for p in _FONT_CANDIDATES:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+_FP = _font_path()
+# The family named in the SVG must resolve to the face PIL measured, or the
+# fit is a lie: cairosvg would lay out with a different face and text that
+# fitted locally would run off the frame on the server.
+if _FP and "Roboto-Black" in _FP:
+    FAMILY = "Roboto Black, Roboto, DejaVu Sans, sans-serif"
+elif _FP and "RobotoCondensed" in _FP:
+    FAMILY = "Roboto Condensed, Roboto, DejaVu Sans, sans-serif"
+else:
+    FAMILY = "DejaVu Sans, sans-serif"
+
+_FCACHE = {}
+
+
+def _load(size):
+    if ImageFont is None or not _FP:
+        return None
+    k = int(size)
+    if k not in _FCACHE:
+        try:
+            _FCACHE[k] = ImageFont.truetype(_FP, k)
+        except Exception:
+            _FCACHE[k] = None
+    return _FCACHE[k]
+
+
+def text_width(s, size):
+    f = _load(size)
+    if f is None:
+        return len(str(s)) * size * 0.62          # errs wide, so text shrinks
+    try:
+        b = f.getbbox(str(s))
+        return b[2] - b[0]
+    except Exception:
+        return len(str(s)) * size * 0.62
+
+
+def fit(s, max_w, start, min_size=MIN_TEXT, step=2):
+    size = int(start)
+    while size > min_size and text_width(s, size) > max_w:
+        size -= step
+    return max(int(min_size), size)
 
 
 def esc(s):
@@ -115,60 +124,97 @@ def esc(s):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def flag_code(name):
-    """Postal code for a US state, ISO code for a country, or None."""
-    k = str(name).strip().lower()
-    if k in STATE_CODES:
-        return "us-" + STATE_CODES[k]
-    if k in COUNTRY_CODES:
-        return COUNTRY_CODES[k]
-    return None
+# ------------------------------------------------------------------ numbers
+def money(n):
+    """Compact enough to be huge on screen: 465000 -> $465K."""
+    n = float(n)
+    neg, n = n < 0, abs(float(n))
+    if n >= 1_000_000:
+        s = ("$%.1fM" % (n / 1_000_000)).replace(".0M", "M")
+    elif n >= 10_000:
+        s = "$%dK" % round(n / 1000)
+    elif n >= 1000:
+        s = "$%s" % format(int(round(n)), ",")
+    else:
+        s = "$%d" % round(n)
+    return ("-" if neg else "") + s
 
 
-def flag_data_uri(name, width=320):
-    """Fetches a flag once and returns it as a data URI.
+def short_name(name, limit=13):
+    n = str(name).strip()
+    if len(n) <= limit:
+        return n.upper()
+    parts = n.split()
+    if len(parts) >= 2:
+        c = parts[0][0] + ". " + " ".join(parts[1:])
+        if len(c) <= limit:
+            return c.upper()
+        c = "".join(p[0] for p in parts)              # United Kingdom -> UK
+        if len(c) >= 2:
+            return c.upper()
+    return n[:limit].upper()
 
-    Embedding rather than linking matters: cairosvg would otherwise fetch the
-    image at rasterise time, and a slow CDN would silently produce a graphic
-    with a blank space where the flag should be.
+
+# ------------------------------------------------------------------ photos
+# Same fetch-and-cache shape visuals.py already runs in production: one call
+# per query, cached to disk, and a clean None on any failure so a missing
+# photo degrades the design instead of breaking the run.
+_PHOTO_MEM = {}
+
+# Order matters and so do word boundaries. The first version listed the
+# housing pattern first and matched on a bare "house", so "median HOUSEhold
+# income" was drawn as a suburban street - the wrong story entirely. Income
+# is tested before housing now, and every term is boundaried.
+SUBJECT_QUERIES = [
+    (r"\b(income|salary|salaries|wage|wages|pay|earnings|paycheck)\b", "%s downtown skyline morning"),
+    (r"\b(childcare|daycare|nursery|preschool)\b",   "empty nursery classroom"),
+    (r"\b(childbirth|maternity|birth)\b",            "hospital maternity room"),
+    (r"\b(health|insurance|medical|hospital|premium)\b", "hospital corridor empty"),
+    (r"\b(grocer|groceries|food|supermarket)\b",     "grocery store aisle full shopping cart"),
+    (r"\b(electric|electricity|power|utility|utilities|energy)\b", "home electricity meter close up"),
+    (r"\b(rent|apartment|lease|renting)\b",          "%s apartment building exterior"),
+    (r"\b(home|homes|house|houses|housing|property|mortgage)\b", "%s suburban house exterior"),
+    (r"\btax(es)?\b",                                "%s suburban street houses"),
+    (r"\b(commute|traffic|transport|fuel|gasoline|petrol)\b", "%s highway traffic"),
+]
+
+
+def photo_query(entity, subject):
+    """A query the search will actually answer well.
+
+    A bare place name returns postcards - mountains, sunsets, license plates -
+    the same travel-brochure look the scripts were cleaned of. The subject has
+    to be in the query or the picture tells the wrong story.
     """
-    code = flag_code(name)
-    if not code:
-        return None
-    key = (code, width)
-    if key in _FLAG_CACHE:
-        return _FLAG_CACHE[key]
-    try:
-        url = "https://flagcdn.com/w%d/%s.png" % (width, code)
-        r = requests.get(url, timeout=20)
-        r.raise_for_status()
-        uri = "data:image/png;base64," + base64.b64encode(r.content).decode()
-        _FLAG_CACHE[key] = uri
-        return uri
-    except Exception:
-        return None
+    s = str(subject or "").lower()
+    for pat, tpl in SUBJECT_QUERIES:
+        if re.search(pat, s):
+            return tpl % entity if "%s" in tpl else tpl
+    return "%s residential neighborhood" % entity
 
 
-# ==================================================================
-#  R011 — photographs
-# ==================================================================
-def photo_data_uri(query):
-    """One Pexels landscape photo for a query, as a data URI.
+def is_place_specific(subject):
+    """True when the query differs per side, so a split shows two pictures.
 
-    Cached in memory for the run and on disk across runs, so the same metric
-    fetches its photograph once no matter how many videos use it. Returns None
-    on any failure - a missing photograph degrades the card, it never breaks
-    the render.
+    Some subjects have no per-place image worth searching - a trolley of
+    groceries looks the same in Idaho and in Kent. Those returned the SAME
+    photo for both halves, which drew a split screen of one identical picture
+    twice. Those subjects get the single-photograph layout instead.
     """
+    s = str(subject or "").lower()
+    for pat, tpl in SUBJECT_QUERIES:
+        if re.search(pat, s):
+            return "%s" in tpl
+    return True
+
+
+def fetch_photo(query):
+    """JPEG bytes for a query, or None. Never raises."""
     if not query:
         return None
-    q = str(query).strip().lower()
-    if q in _PHOTO_CACHE:
-        return _PHOTO_CACHE[q]
-
-    os.makedirs(PHOTO_DIR, exist_ok=True)
-    disk = os.path.join(PHOTO_DIR, hashlib.md5(q.encode()).hexdigest() + ".jpg")
-
+    if query in _PHOTO_MEM:
+        return _PHOTO_MEM[query]
+    disk = os.path.join(PHOTO_DIR, hashlib.md5(query.encode()).hexdigest() + ".jpg")
     raw = None
     if os.path.exists(disk):
         try:
@@ -176,25 +222,23 @@ def photo_data_uri(query):
                 raw = f.read()
         except Exception:
             raw = None
-
     if raw is None:
         key = os.environ.get("PEXELS_API_KEY")
-        if not key:
+        if not key or requests is None:
             return None
         try:
-            r = requests.get(
-                "https://api.pexels.com/v1/search",
-                params={"query": q, "per_page": 1,
-                        "orientation": "landscape", "size": "large"},
-                headers={"Authorization": key}, timeout=25)
+            r = requests.get("https://api.pexels.com/v1/search",
+                             params={"query": query, "per_page": 1,
+                                     "orientation": "landscape", "size": "large"},
+                             headers={"Authorization": key}, timeout=25)
             r.raise_for_status()
             photos = r.json().get("photos") or []
             if not photos:
                 return None
             src = photos[0]["src"].get("large2x") or photos[0]["src"].get("large")
-            img = requests.get(src, timeout=40)
-            img.raise_for_status()
-            raw = img.content
+            im = requests.get(src, timeout=40)
+            im.raise_for_status()
+            raw = im.content
             try:
                 with open(disk, "wb") as f:
                     f.write(raw)
@@ -202,528 +246,265 @@ def photo_data_uri(query):
                 pass
         except Exception:
             return None
-
-    uri = "data:image/jpeg;base64," + base64.b64encode(raw).decode()
-    _PHOTO_CACHE[q] = uri
-    return uri
-
-
-def _photo_layer(query, x, y, w, h, scrim="bottom", clip_id=None):
-    """A photograph filling a box, with a gradient scrim so type stays legible."""
-    uri = photo_data_uri(query)
-    if not uri:
-        return ""
-    gid = "sc_%s" % (clip_id or abs(hash((x, y, w, h, scrim))) % 99999)
-    if scrim == "bottom":
-        grad = ('<linearGradient id="%s" x1="0" y1="0" x2="0" y2="1">'
-                '<stop offset="0.30" stop-color="%s" stop-opacity="0.10"/>'
-                '<stop offset="1" stop-color="%s" stop-opacity="0.92"/></linearGradient>'
-                % (gid, BG, BG))
-    elif scrim == "right":
-        grad = ('<linearGradient id="%s" x1="0" y1="0" x2="1" y2="0">'
-                '<stop offset="0.45" stop-color="%s" stop-opacity="0"/>'
-                '<stop offset="1" stop-color="%s" stop-opacity="1"/></linearGradient>'
-                % (gid, BG, BG))
-    else:  # full — an even wash, for a card that carries a big number on top
-        grad = ('<linearGradient id="%s" x1="0" y1="0" x2="0" y2="1">'
-                '<stop offset="0" stop-color="%s" stop-opacity="0.72"/>'
-                '<stop offset="1" stop-color="%s" stop-opacity="0.86"/></linearGradient>'
-                % (gid, BG, BG))
-    return ('<defs>%s</defs>'
-            '<image x="%.0f" y="%.0f" width="%.0f" height="%.0f" xlink:href="%s" '
-            'preserveAspectRatio="xMidYMid slice"/>'
-            '<rect x="%.0f" y="%.0f" width="%.0f" height="%.0f" fill="url(#%s)"/>'
-            % (grad, x, y, w, h, uri, x, y, w, h, gid))
+    if not raw or len(raw) < 2000:
+        return None
+    _PHOTO_MEM[query] = raw
+    return raw
 
 
-def fit(text, size, max_width, min_size=28):
-    """Shrinks a font size until the string fits. DejaVu Sans averages about
-    0.58 em per character, which is close enough for headline-length strings."""
-    est = len(str(text)) * size * 0.58
-    while est > max_width and size > min_size:
-        size -= 2
-        est = len(str(text)) * size * 0.58
-    return size
+def _uri(raw):
+    return "data:image/jpeg;base64," + base64.b64encode(raw).decode()
 
 
-def wrap(text, chars_per_line, max_lines=4):
-    words = str(text).split()
-    lines, cur = [], ""
-    for w in words:
-        if len((cur + " " + w).strip()) <= chars_per_line:
-            cur = (cur + " " + w).strip()
-        else:
-            if cur:
-                lines.append(cur)
-            cur = w
-    if cur:
-        lines.append(cur)
-    return lines[:max_lines]
+# ------------------------------------------------------------------ drawing
+_EMITTED = []
 
 
-def _open(extra=""):
-    return (
-        '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
-        'width="%d" height="%d" viewBox="0 0 %d %d">'
-        '<rect width="%d" height="%d" fill="%s"/>%s'
-    ) % (W, H, W, H, W, H, BG, extra)
-
-
-def _eyebrow(text, y=62):
-    """R006: a category label, drawn from the spec. Never taken from the
-    headline - "ADDS UP" above "Every Small Fee Adds Up" reads as a bug."""
-    if not text:
-        return ""
-    return ('<text x="%d" y="%d" fill="%s" font-family="%s" font-size="30" '
-            'font-weight="bold" text-anchor="middle" letter-spacing="5">%s</text>'
-            ) % (W // 2, y, ACCENT, FONT, esc(str(text).upper()))
-
-
-def _title(text, y=110):
-    if not text:
-        return ""
-    size = fit(text, 52, W - 280, 34)
-    return ('<text x="%d" y="%d" fill="%s" font-family="%s" font-size="%d" '
-            'font-weight="bold" text-anchor="middle" letter-spacing="1">%s</text>'
-            ) % (W // 2, y, MUTED, FONT, size, esc(text.upper()))
-
-
-# ==================================================================
-#  1. flag_vs — two places, side by side
-# ==================================================================
-def flag_vs(a, b, title=None, sub_a=None, sub_b=None, eyebrow=None):
-    parts = [_eyebrow(eyebrow), _title(title, 130)]
-    fw, fh = 560, 373
-    cy = 420
-    for i, (name, sub, colour) in enumerate([(a, sub_a, ACCENT), (b, sub_b, COOL)]):
-        cx = W * (0.27 if i == 0 else 0.73)
-        uri = flag_data_uri(name, 640)
-        x, y = cx - fw / 2, cy - fh / 2
-        if uri:
-            parts.append(
-                '<image x="%d" y="%d" width="%d" height="%d" xlink:href="%s" '
-                'preserveAspectRatio="xMidYMid slice"/>'
-                '<rect x="%d" y="%d" width="%d" height="%d" fill="none" stroke="%s" stroke-width="5"/>'
-                % (x, y, fw, fh, uri, x, y, fw, fh, colour))
-        else:
-            parts.append(state_shape_svg(name, fw, fh, x, y, colour))
-        size = fit(name, 76, fw + 140, 38)
-        parts.append(
-            '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="%d" '
-            'font-weight="bold" text-anchor="middle">%s</text>'
-            % (cx, cy + fh / 2 + 108, INK, FONT, size, esc(name)))
-        if sub:
-            # These carry the hook figure on the title card, so they are set as
-            # figures - in the entity's own colour, at a size a viewer reads in
-            # the first second - not as grey small print under the name.
-            parts.append(
-                '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="72" '
-                'font-weight="bold" text-anchor="middle">%s</text>'
-                % (cx, cy + fh / 2 + 184, colour, FONT, esc(sub)))
-    parts.append(
-        '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="62" '
-        'font-weight="bold" text-anchor="middle">vs</text>'
-        % (W // 2, cy + 22, MUTED, FONT))
-    return _open() + "".join(parts) + "</svg>"
-
-
-def state_shape_svg(name, box_w, box_h, x, y, colour):
-    """Fallback when a flag image is unavailable: draw the place's own outline.
-
-    A grey rectangle where a flag should be looks broken. The state silhouette
-    carries the same information and uses geometry we already ship.
-    """
-    paths = _load_paths()
-    key = next((k for k in paths if k.lower() == str(name).strip().lower()), None)
-    if not key:
-        return ('<rect x="%d" y="%d" width="%d" height="%d" fill="%s" '
-                'stroke="%s" stroke-width="4"/>' % (x, y, box_w, box_h, PANEL, colour))
-    d = paths[key]
-    xs, ys = [], []
-    for tok in d.replace("M", " ").replace("L", " ").replace("Z", " ").split():
-        if "," in tok:
-            px, py = tok.split(",")
-            xs.append(float(px)); ys.append(float(py))
-    if not xs:
-        return ""
-    bw, bh = max(xs) - min(xs), max(ys) - min(ys)
-    sc = min(box_w / (bw or 1), box_h / (bh or 1)) * 0.86
-    tx = x + (box_w - bw * sc) / 2 - min(xs) * sc
-    ty = y + (box_h - bh * sc) / 2 - min(ys) * sc
-    return ('<g transform="translate(%.1f,%.1f) scale(%.3f)">'
-            '<path d="%s" fill="%s" stroke="%s" stroke-width="%.1f"/></g>'
-            % (tx, ty, sc, d, colour, INK, 2.0 / sc))
-
-
-# ==================================================================
-#  2. map — one or two states located on the country
-# ==================================================================
-def us_map(highlight, title=None, labels=True, eyebrow=None):
-    if isinstance(highlight, str):
-        highlight = [highlight]
-    hl = {h.strip().lower(): i for i, h in enumerate(highlight)}
-    colours = [ACCENT, COOL]
-    paths = _load_paths()
-    body, marks = [], []
-
-    # The map art is 1000x620; place it centred inside the safe area.
-    mw, mh = 1000, 620
-    sc = 1.42
-    ox = (W - mw * sc) / 2
-    oy = 150
-
-    for name, d in paths.items():
-        idx = hl.get(name.lower())
-        fill = colours[idx % 2] if idx is not None else DIM
-        stroke = INK if idx is not None else BG
-        body.append('<path d="%s" fill="%s" stroke="%s" stroke-width="%s"/>'
-                    % (d, fill, stroke, "2.4" if idx is not None else "1.4"))
-    g = ('<g transform="translate(%.1f,%.1f) scale(%.3f)">%s</g>'
-         % (ox, oy, sc, "".join(body)))
-
-    out = [_eyebrow(eyebrow), _title(title, 100), g]
-
-    if labels:
-        for i, name in enumerate(highlight):
-            key = next((k for k in paths if k.lower() == name.strip().lower()), None)
-            if not key:
-                continue
-            d = paths[key]
-            nums = [p for p in d.replace("M", " ").replace("L", " ").replace("Z", " ").split()]
-            xs, ys = [], []
-            for n in nums:
-                if "," in n:
-                    px, py = n.split(",")
-                    xs.append(float(px)); ys.append(float(py))
-            if not xs:
-                continue
-            cx = ox + (sum(xs) / len(xs)) * sc
-            cy = oy + (sum(ys) / len(ys)) * sc
-            size = fit(name, 46, 460, 30)
-            tw = len(name) * size * 0.60 + 44
-            marks.append(
-                '<rect x="%.0f" y="%.0f" width="%.0f" height="62" rx="8" fill="%s" opacity="0.92"/>'
-                '<text x="%.0f" y="%.0f" fill="%s" font-family="%s" font-size="%d" '
-                'font-weight="bold" text-anchor="middle">%s</text>'
-                % (cx - tw / 2, cy - 31, tw, BG, cx, cy + 15, colours[i % 2], FONT, size, esc(name)))
-        out.extend(marks)
-    return _open() + "".join(out) + "</svg>"
-
-
-# ==================================================================
-#  3. bar_pair — the workhorse: two figures, one metric
-# ==================================================================
-def bar_pair(label_a, value_a, label_b, value_b, title=None,
-             display_a=None, display_b=None, unit=None,
-             eyebrow=None, photo_query=None):
-    """
-    R002 — HORIZONTAL and thin.
-
-    This used to draw two vertical columns 330px wide and up to ~450px tall.
-    They read as heavy blocks rather than a measurement, and the two figures
-    were the only thing on screen for up to fifty seconds at a time.
-
-    Now: 56px high, up to 1200px long, label in its own column on the left,
-    figure just past the end of its own bar, faint gridlines behind. Long and
-    thin. If photo_query is given the left third carries a photograph and the
-    bars occupy the rest.
-    """
-    va, vb = float(value_a), float(value_b)
-    top = max(abs(va), abs(vb)) or 1.0
-    da = display_a if display_a is not None else "{:,.0f}".format(va)
-    db = display_b if display_b is not None else "{:,.0f}".format(vb)
-
-    parts = []
-    bar_x, max_len = 460, 1160
-
-    if photo_query:
-        pw = int(W * 0.34)
-        layer = _photo_layer(photo_query, 0, 0, pw, SAFE_H, scrim="right", clip_id="bp")
-        if layer:
-            parts.append(layer)
-            bar_x, max_len = pw + 300, W - (pw + 300) - 260
-
-    parts.append(_eyebrow(eyebrow))
-    parts.append(_title(title, 130))
-
-    BAR_H, BAR_GAP = 56, 40
-    block_h = BAR_H * 2 + BAR_GAP
-    top_y = 470 - block_h // 2
-
-    # faint gridlines behind the bars, so a length reads as a quantity
-    for g in (0.25, 0.5, 0.75):
-        gx = bar_x + max_len * g
-        parts.append('<line x1="%.0f" y1="%.0f" x2="%.0f" y2="%.0f" stroke="%s" '
-                     'stroke-width="2"/>' % (gx, top_y - 30, gx, top_y + block_h + 30, PANEL))
-
-    for i, (lab, val, disp, colour) in enumerate(
-            [(label_a, va, da, ACCENT), (label_b, vb, db, COOL)]):
-        by = top_y + i * (BAR_H + BAR_GAP)
-        length = max(10, (abs(val) / top) * max_len)
-
-        # label right-aligned into its own column, never on top of the bar
-        lsize = fit(lab, 44, bar_x - 60, 26)
-        parts.append(
-            '<text x="%.0f" y="%.0f" fill="%s" font-family="%s" font-size="%d" '
-            'font-weight="bold" text-anchor="end">%s</text>'
-            % (bar_x - 34, by + BAR_H * 0.72, MUTED, FONT, lsize, esc(lab)))
-
-        parts.append('<rect x="%.0f" y="%.0f" width="%.0f" height="%d" rx="4" fill="%s"/>'
-                     % (bar_x, by, length, BAR_H, colour))
-
-        # figure just past the end of its own bar - outside, never inside
-        vsize = 52
-        vx = bar_x + length + 26
-        if vx + len(str(disp)) * vsize * 0.58 > W - 40:
-            vx = bar_x + length - 26
-            parts.append(
-                '<text x="%.0f" y="%.0f" fill="%s" font-family="%s" font-size="%d" '
-                'font-weight="bold" text-anchor="end">%s</text>'
-                % (vx, by + BAR_H * 0.74, BG, FONT, vsize, esc(disp)))
-        else:
-            parts.append(
-                '<text x="%.0f" y="%.0f" fill="%s" font-family="%s" font-size="%d" '
-                'font-weight="bold">%s</text>'
-                % (vx, by + BAR_H * 0.74, INK, FONT, vsize, esc(disp)))
-
-    if unit:
-        parts.append(
-            '<text x="%.0f" y="%.0f" fill="%s" font-family="%s" font-size="34" '
-            'text-anchor="middle">%s</text>'
-            % (bar_x + max_len / 2, top_y + block_h + 110, MUTED, FONT, esc(unit)))
-
-    return _open() + "".join(parts) + "</svg>"
-
-
-# ==================================================================
-#  4. big_stat — one figure, full frame
-# ==================================================================
-def big_stat(value, caption=None, title=None, colour=ACCENT,
-             eyebrow=None, context_a=None, context_b=None, photo_query=None):
-    """
-    R002 — a gap is never shown on its own.
-
-    The published video put "$4" and "$81" alone on a dark field. Eighty-one
-    dollars means nothing without the figures it came from; against rent of
-    $1,850 it is 4.4%. When context_a / context_b are supplied they are drawn
-    under the headline number.
-    """
-    parts = []
-
-    # Did we actually get a photograph? This matters more than it looks.
-    #
-    # photo_stat and big_stat are the same function; only photo_query differs.
-    # When the photo could not be fetched the two rendered BYTE-IDENTICAL, so a
-    # sequence built to alternate between them showed one unchanging picture -
-    # measured as an 18.7-second static hold, with the cuts between the pieces
-    # invisible to scene detection.
-    #
-    # A missing photo must still produce a different card, so the layout shifts:
-    # the figure moves off-centre against an accent rule instead of sitting
-    # dead centre. Nothing depends on the network to stay visually distinct.
-    layer = None
-    if photo_query:
-        layer = _photo_layer(photo_query, 0, 0, W, H, scrim="full", clip_id="bs")
-        if layer:
-            parts.append(layer)
-    # _photo_layer returns "" when there is no photo, not None. Testing for
-    # None meant the fallback layout never triggered and the two cards stayed
-    # byte-identical - the bug this whole branch exists to prevent.
-    offset = bool(photo_query) and not layer
-
-    parts.append(_eyebrow(eyebrow))
-    parts.append(_title(title, 130))
-
-    size = fit(value, 260, W - 320, 90)
-    if offset:
-        parts.append('<rect x="140" y="368" width="12" height="210" fill="%s" rx="6"/>'
-                     % colour)
-        parts.append(
-            '<text x="196" y="%d" fill="%s" font-family="%s" font-size="%d" '
-            'font-weight="bold">%s</text>'
-            % (540, colour, FONT, min(size, 230), esc(value)))
+def _t(x, y, s, size, fill=INK, anchor="middle"):
+    tw = text_width(s, size)
+    if anchor == "middle":
+        x0, x1 = x - tw / 2.0, x + tw / 2.0
+    elif anchor == "end":
+        x0, x1 = x - tw, x
     else:
-        parts.append(
-            '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="%d" '
-            'font-weight="bold" text-anchor="middle">%s</text>'
-            % (W // 2, 520, colour, FONT, size, esc(value)))
-
-    y = 640
-    if caption:
-        for i, ln in enumerate(wrap(caption, 34, 2)):
-            if offset:
-                parts.append(
-                    '<text x="196" y="%d" fill="%s" font-family="%s" font-size="52">%s</text>'
-                    % (y + i * 74, INK, FONT, esc(ln)))
-            else:
-                parts.append(
-                    '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="56" '
-                    'text-anchor="middle">%s</text>'
-                    % (W // 2, y + i * 74, INK, FONT, esc(ln)))
-        y += 74 * len(wrap(caption, 34, 2))
-
-    if context_a and context_b:
-        ay = min(y + 46, SAFE_H - 40)
-        a_txt = "%s  %s" % (context_a.get("label", ""), context_a.get("display", ""))
-        b_txt = "%s  %s" % (context_b.get("label", ""), context_b.get("display", ""))
-        parts.append(
-            '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="40" '
-            'font-weight="bold" text-anchor="end">%s</text>'
-            % (W // 2 - 46, ay, ACCENT, FONT, esc(a_txt)))
-        parts.append(
-            '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="32" '
-            'text-anchor="middle">vs</text>' % (W // 2, ay, MUTED, FONT))
-        parts.append(
-            '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="40" '
-            'font-weight="bold">%s</text>'
-            % (W // 2 + 46, ay, COOL, FONT, esc(b_txt)))
-
-    if not offset:
-        parts.append('<rect x="%d" y="%d" width="220" height="8" fill="%s" rx="4"/>'
-                     % (W // 2 - 110, 300, colour))
-    return _open() + "".join(parts) + "</svg>"
+        x0, x1 = x, x + tw
+    _EMITTED.append({"text": str(s), "size": size, "x0": x0, "x1": x1,
+                     "y0": y - size * 0.76, "y1": y + size * 0.24})
+    # Heavy type on a photograph needs its own edge or it vanishes the moment
+    # the picture behind it goes pale. Drawn twice: a dark stroke, then fill.
+    common = ('font-family="%s" font-size="%d" font-weight="900" text-anchor="%s"'
+              % (FAMILY, size, anchor))
+    return ('<text x="%d" y="%d" %s fill="none" stroke="%s" stroke-width="%d" '
+            'stroke-linejoin="round" opacity="0.85">%s</text>'
+            '<text x="%d" y="%d" %s fill="%s">%s</text>'
+            % (x, y, common, SHADE, max(5, int(size * 0.075)), esc(s),
+               x, y, common, fill, esc(s)))
 
 
-# ==================================================================
-#  5. photo_full — a photograph carrying one line of caption
-# ==================================================================
-def photo_full(photo_query, caption=None, eyebrow=None, title=None):
-    """R011. The published video had no photographs at all, and 36% of its
-    runtime was a single repeated layout. A real image every few shots is the
-    cheapest variety there is."""
-    layer = _photo_layer(photo_query, 0, 0, W, H, scrim="bottom", clip_id="pf")
-    if not layer:
-        # No key, no network, no photo - fall back to a card that still reads.
-        return statement(caption or title or "", kicker=eyebrow)
-
-    parts = [layer, _eyebrow(eyebrow)]
-    if caption:
-        lines = wrap(caption, 32, 3)
-        size = 72 if len(lines) <= 2 else 60
-        start = SAFE_H - 40 - (len(lines) - 1) * size * 1.24
-        for i, ln in enumerate(lines):
-            parts.append(
-                '<text x="%d" y="%.0f" fill="%s" font-family="%s" font-size="%d" '
-                'font-weight="bold" text-anchor="middle">%s</text>'
-                % (W // 2, start + i * size * 1.24, INK, FONT, size, esc(ln)))
-    return _open() + "".join(parts) + "</svg>"
+def validate(margin=26):
+    out = []
+    for e in _EMITTED:
+        if e["x0"] < margin or e["x1"] > W - margin:
+            out.append('"%s" (%dpx) runs off the frame: x %.0f..%.0f'
+                       % (e["text"][:26], e["size"], e["x0"], e["x1"]))
+        if e["y0"] < 0 or e["y1"] > H:
+            out.append('"%s" runs off vertically: y %.0f..%.0f'
+                       % (e["text"][:26], e["y0"], e["y1"]))
+        if e["size"] < MIN_TEXT:
+            out.append('"%s" is %dpx, under the %dpx floor' % (e["text"][:26], e["size"], MIN_TEXT))
+    return out
 
 
-# ==================================================================
-#  6. statement — typographic card, no data
-# ==================================================================
-def statement(text, kicker=None, eyebrow=None):
-    parts = []
-    lead = kicker or eyebrow
-    if lead:
-        parts.append(
-            '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="40" '
-            'text-anchor="middle" letter-spacing="3">%s</text>'
-            % (W // 2, 210, ACCENT, FONT, esc(str(lead).upper())))
-    lines = wrap(text, 26, 4)
-    size = 96 if len(lines) <= 2 else 76
-    start = 420 - (len(lines) - 1) * (size * 0.62)
-    for i, ln in enumerate(lines):
-        parts.append(
-            '<text x="%d" y="%.0f" fill="%s" font-family="%s" font-size="%d" '
-            'font-weight="bold" text-anchor="middle">%s</text>'
-            % (W // 2, start + i * size * 1.24, INK, FONT, size, esc(ln)))
-    parts.append('<rect x="%d" y="%d" width="160" height="6" fill="%s" rx="3"/>'
-                 % (W // 2 - 80, 280, ACCENT))
-    return _open() + "".join(parts) + "</svg>"
+def _defs():
+    return (
+        '<defs>'
+        # bottom scrim: the hook always sits on something dark
+        '<linearGradient id="hook" x1="0" y1="0" x2="0" y2="1">'
+        '<stop offset="0" stop-color="%s" stop-opacity="0"/>'
+        '<stop offset="0.45" stop-color="%s" stop-opacity="0.80"/>'
+        '<stop offset="1" stop-color="%s" stop-opacity="0.96"/></linearGradient>'
+        # top scrim, lighter: the numbers need contrast without hiding the photo
+        '<linearGradient id="top" x1="0" y1="0" x2="0" y2="1">'
+        '<stop offset="0" stop-color="%s" stop-opacity="0.62"/>'
+        '<stop offset="1" stop-color="%s" stop-opacity="0.10"/></linearGradient>'
+        '</defs>' % (SHADE, SHADE, SHADE, SHADE, SHADE)
+    )
 
 
-# ==================================================================
-#  7. tally — the running scoreboard
-# ==================================================================
-def tally(name_a, score_a, name_b, score_b, title="RUNNING TOTAL", rows=None,
-          eyebrow=None):
+def _photo_half(raw, x, w, tint, tint_op=0.20):
+    """A photograph filling one half, graded toward warm or cool."""
+    if raw:
+        img = ('<image x="%d" y="0" width="%d" height="%d" xlink:href="%s" '
+               'preserveAspectRatio="xMidYMid slice"/>' % (x, w, H, _uri(raw)))
+    else:
+        # no photo: a deep graded panel, still cinematic, never a flat block
+        img = ('<rect x="%d" y="0" width="%d" height="%d" fill="%s"/>'
+               '<rect x="%d" y="0" width="%d" height="%d" fill="%s" opacity="0.30"/>'
+               % (x, w, H, SHADE, x, w, H, tint))
+    return (img + '<rect x="%d" y="0" width="%d" height="%d" fill="%s" opacity="%.2f"/>'
+            % (x, w, H, tint, tint_op))
+
+
+def _hook_band(hook, top=498):
+    size = fit(hook, W - 110, 108, MIN_TEXT)
+    return ('<rect x="0" y="%d" width="%d" height="%d" fill="url(#hook)"/>' % (top, W, H - top)
+            + _t(W // 2, 646, hook, size))
+
+
+# ------------------------------------------------------------------ layouts
+def _lay_split(d):
+    """Two photographs, hard vertical divide. The default and the clearest."""
+    half = W // 2
+    la, lb = short_name(d["a"]), short_name(d["b"])
+    ns = min(fit(la, half - 90, 74, MIN_TEXT), fit(lb, half - 90, 74, MIN_TEXT))
+    va, vb = money(d["va"]), money(d["vb"])
+    vs = min(fit(va, half - 70, 184, 96), fit(vb, half - 70, 184, 96))
+    return "".join([
+        _defs(),
+        _photo_half(d["pa"], 0, half, WARM),
+        _photo_half(d["pb"], half, W - half, COOL),
+        '<rect x="0" y="0" width="%d" height="250" fill="url(#top)"/>' % W,
+        '<rect x="%d" y="0" width="8" height="%d" fill="%s" opacity="0.92"/>' % (half - 4, H, SHADE),
+        _t(half // 2, 150, la, ns),
+        _t(half // 2, 316, va, vs),
+        _t(half + half // 2, 150, lb, ns),
+        _t(half + half // 2, 316, vb, vs),
+        _hook_band(d["hook"]),
+    ])
+
+
+def _lay_diagonal(d):
+    """Same story, different construction - the brief asks the shape to vary."""
+    half = W // 2
+    la, lb = short_name(d["a"]), short_name(d["b"])
+    ns = min(fit(la, 470, 70, MIN_TEXT), fit(lb, 470, 70, MIN_TEXT))
+    va, vb = money(d["va"]), money(d["vb"])
+    vs = min(fit(va, 470, 172, 96), fit(vb, 470, 172, 96))
+    return "".join([
+        _defs(),
+        '<clipPath id="cl"><polygon points="0,0 720,0 560,720 0,720"/></clipPath>',
+        '<clipPath id="cr"><polygon points="720,0 1280,0 1280,720 560,720"/></clipPath>',
+        '<g clip-path="url(#cl)">%s</g>' % _photo_half(d["pa"], 0, 760, WARM),
+        '<g clip-path="url(#cr)">%s</g>' % _photo_half(d["pb"], 520, W - 520, COOL),
+        '<rect x="0" y="0" width="%d" height="250" fill="url(#top)"/>' % W,
+        '<polygon points="724,0 764,0 604,720 564,720" fill="%s" opacity="0.92"/>' % SHADE,
+        _t(292, 148, la, ns),
+        _t(292, 306, va, vs),
+        _t(958, 148, lb, ns),
+        _t(958, 306, vb, vs),
+        _hook_band(d["hook"]),
+    ])
+
+
+def _lay_hero(d):
+    """One photograph, both numbers over it. For when a single image carries
+    the whole idea - a full trolley, a meter, a maternity room."""
+    raw = d["pa"] or d["pb"]
+    la, lb = short_name(d["a"]), short_name(d["b"])
+    ns = min(fit(la, 480, 66, MIN_TEXT), fit(lb, 480, 66, MIN_TEXT))
+    va, vb = money(d["va"]), money(d["vb"])
+    vs = min(fit(va, 470, 176, 96), fit(vb, 470, 176, 96))
+    return "".join([
+        _defs(),
+        _photo_half(raw, 0, W, WARM, tint_op=0.12),
+        '<rect x="0" y="0" width="%d" height="%d" fill="%s" opacity="0.42"/>' % (W, H, SHADE),
+        '<rect x="0" y="0" width="%d" height="300" fill="url(#top)"/>' % W,
+        _t(310, 150, la, ns),
+        _t(310, 322, va, vs),
+        _t(970, 150, lb, ns),
+        _t(970, 322, vb, vs),
+        '<rect x="%d" y="188" width="7" height="150" fill="%s" opacity="0.9"/>' % (W // 2 - 3, INK),
+        _hook_band(d["hook"]),
+    ])
+
+
+LAYOUTS = {"split": _lay_split, "diagonal": _lay_diagonal, "hero": _lay_hero}
+
+
+def choose_layout(d):
+    """Vary the construction, but never at the cost of clarity.
+
+    Two photographs support a split or a diagonal; one photograph only
+    supports the hero. The hash rotates between whatever is genuinely
+    available so sixty videos do not share one composition.
     """
-    R007 — the detail list is left-aligned in one column with its dot in a
-    fixed gutter. It used to be centred with the dot placed under whichever
-    side won, which put the marker on top of the text: "...car insurance per
-    yea●". The list also used to run past the safe line into the subtitles.
+    # Two DIFFERENT photographs are what a split needs. Identical ones - which
+    # is what a subject-only query returns for both sides - make a split screen
+    # of the same picture twice.
+    two_pictures = bool(d["pa"]) and bool(d["pb"]) and d["qa"] != d["qb"]
+    if two_pictures:
+        eligible = ["split", "diagonal"]
+    elif d["pa"] or d["pb"]:
+        eligible = ["hero"]                  # one picture, so draw it once
+    else:
+        # No photograph at all - Pexels down, no key, nothing cached. The hero
+        # fallback painted one flat tinted panel and looked like mud. A split
+        # of the two graded panels still separates warm from cool, which is
+        # the one thing carrying the comparison when there is no picture.
+        eligible = ["split"]
+    seed = hashlib.md5(("%s|%s|%s" % (d["a"], d["b"], d["subject"])).encode()).hexdigest()
+    return eligible[int(seed[:8], 16) % len(eligible)]
+
+
+# ------------------------------------------------------------------ spec
+_ANSWER_WORDS = re.compile(
+    r"\b(wins?|loses?|beats?|cheaper|pricier|costlier|winner|better|worse|"
+    r"ahead|behind|richer|poorer)\b", re.I)
+
+
+# A repeated phrase stops working within about three uploads, so the fallback
+# rotates instead of stamping one line on every video that needs it.
+_FALLBACKS = ["WHO ACTUALLY WINS?", "NOT WHAT YOU THINK", "WORTH IT?",
+              "CHEAPER = EASIER?", "WHO CAN AFFORD IT?", "THE REAL COST"]
+
+
+def clean_hook(hook, a, b):
+    """The hook must pose the question, not settle it.
+
+    The first version of this rejected any hook containing "wins", "cheaper"
+    or "loses" - and so threw out "WHO ACTUALLY WINS?" and "CHEAPER =
+    EASIER?", both of which are exactly right. The word is not the problem;
+    the GRAMMAR is. A question opens a gap. A flat statement of the result
+    closes it, which is what "THE CHEAPER HOME LOSES" did.
+
+    So: an answer-word is only a defect in a sentence that ASSERTS - one with
+    no question mark. Naming either place is always a defect; that is the
+    title's job, and repeating it on the image wastes the frame.
     """
-    parts = [_eyebrow(eyebrow), _title(title, 110)]
-    cy = 300
-    for i, (name, score, colour) in enumerate(
-            [(name_a, score_a, ACCENT), (name_b, score_b, COOL)]):
-        cx = W * (0.28 if i == 0 else 0.72)
-        parts.append(
-            '<text x="%.0f" y="%d" fill="%s" font-family="%s" font-size="%d" '
-            'font-weight="bold" text-anchor="middle">%s</text>'
-            % (cx, cy, MUTED, FONT, fit(name, 52, 620, 32), esc(name)))
-        parts.append(
-            '<text x="%.0f" y="%d" fill="%s" font-family="%s" font-size="168" '
-            'font-weight="bold" text-anchor="middle">%s</text>'
-            % (cx, cy + 150, colour, FONT, esc(score)))
-    parts.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="%s" stroke-width="3"/>'
-                 % (W // 2, cy - 60, W // 2, cy + 172, PANEL))
-
-    if rows:
-        list_x = 520          # fixed gutter for the dots
-        text_x = list_x + 46
-        y = cy + 246
-        room = max(0, (SAFE_H - 24 - y) // 46)
-        for r in rows[:min(6, room)]:
-            who = str(r.get("winner", ""))
-            left = who.strip().lower() == str(name_a).strip().lower()
-            colour = ACCENT if left else COOL
-            metric = str(r.get("metric", ""))
-            if len(metric) > 42:
-                metric = metric[:41].rstrip() + "…"
-            parts.append(
-                '<circle cx="%d" cy="%d" r="11" fill="%s"/>'
-                '<text x="%d" y="%d" fill="%s" font-family="%s" font-size="36">%s</text>'
-                % (list_x, y - 11, colour, text_x, y, MUTED, FONT, esc(metric)))
-            y += 46
-    return _open() + "".join(parts) + "</svg>"
+    h = re.sub(r"\s+", " ", str(hook or "")).strip().upper().strip(".!")
+    words = [w for w in re.split(r"\s+", h) if w]
+    asks = h.endswith("?")
+    bad = (not h
+           or len(words) > 4
+           or (not asks and _ANSWER_WORDS.search(h))
+           or str(a).upper() in h
+           or str(b).upper() in h)
+    if not bad:
+        return h
+    seed = int(hashlib.md5(("%s|%s" % (a, b)).encode()).hexdigest()[:8], 16)
+    return _FALLBACKS[seed % len(_FALLBACKS)]
 
 
-# ==================================================================
-#  dispatcher
-# ==================================================================
-def build_svg(spec):
-    t = str(spec.get("type", "statement")).lower()
-    eb = spec.get("eyebrow")
+def build_spec(payload):
+    a = payload.get("entity_a") or "A"
+    b = payload.get("entity_b") or "B"
+    va = float(payload.get("value_a") or 0)
+    vb = float(payload.get("value_b") or 0)
+    subject = payload.get("subject") or "cost of living"
 
-    if t == "flag_vs":
-        return flag_vs(spec.get("entity_a"), spec.get("entity_b"),
-                       spec.get("title"), spec.get("sub_a"), spec.get("sub_b"),
-                       eyebrow=eb)
+    qa = payload.get("photo_query_a") or photo_query(a, subject)
+    qb = payload.get("photo_query_b") or photo_query(b, subject)
+    if not is_place_specific(subject):
+        qb = qa                      # one picture, drawn once, hero layout
 
-    if t == "map":
-        return us_map(spec.get("highlight") or [], spec.get("title"), eyebrow=eb)
-
-    if t in ("bar_pair", "photo_split"):
-        return bar_pair(spec.get("label_a"), spec.get("value_a"),
-                        spec.get("label_b"), spec.get("value_b"),
-                        spec.get("title"), spec.get("display_a"),
-                        spec.get("display_b"), spec.get("unit"),
-                        eyebrow=eb,
-                        photo_query=spec.get("photo_query") if t == "photo_split" else None)
-
-    if t in ("big_stat", "photo_stat"):
-        return big_stat(spec.get("value", ""), spec.get("caption"), spec.get("title"),
-                        eyebrow=eb,
-                        context_a=spec.get("context_a"), context_b=spec.get("context_b"),
-                        photo_query=spec.get("photo_query") if t == "photo_stat" else None)
-
-    if t == "photo_full":
-        return photo_full(spec.get("photo_query"), spec.get("caption"),
-                          eyebrow=eb, title=spec.get("title"))
-
-    if t == "tally":
-        return tally(spec.get("name_a"), spec.get("score_a"),
-                     spec.get("name_b"), spec.get("score_b"),
-                     spec.get("title", "RUNNING TOTAL"), spec.get("rows"),
-                     eyebrow=eb)
-
-    return statement(spec.get("text", ""), spec.get("kicker"), eyebrow=eb)
+    return {
+        "a": a, "b": b, "va": va, "vb": vb, "subject": subject,
+        "hook": clean_hook(payload.get("hook"), a, b),
+        "pa": fetch_photo(qa), "pb": fetch_photo(qb),
+        "qa": qa, "qb": qb,
+        "layout": payload.get("layout"),
+    }
 
 
-def render_png(spec, dest_path):
-    svg = build_svg(spec)
-    cairosvg.svg2png(bytestring=svg.encode("utf-8"), write_to=dest_path,
-                     output_width=W, output_height=H)
-    return dest_path
+def render_svg(payload):
+    del _EMITTED[:]
+    d = build_spec(payload)
+    name = d.get("layout") or choose_layout(d)
+    if name not in LAYOUTS:
+        name = "split"
+    body = LAYOUTS[name](d)
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" '
+           'xmlns:xlink="http://www.w3.org/1999/xlink" '
+           'width="%d" height="%d" viewBox="0 0 %d %d">%s</svg>'
+           % (W, H, W, H, body))
+    return svg, name, d
+
+
+def render_png(payload, out_path=None):
+    svg, name, d = render_svg(payload)
+    png = cairosvg.svg2png(bytestring=svg.encode("utf-8"),
+                           output_width=W, output_height=H)
+    if out_path:
+        with open(out_path, "wb") as f:
+            f.write(png)
+    return png, name, d
