@@ -34,6 +34,12 @@ except Exception as _e:
     qc_gate = None
     _MODULE_ERRORS["qc_gate"] = f"{type(_e).__name__}: {_e}"
 
+try:
+    import thumbnail
+except Exception as _e:
+    thumbnail = None
+    _MODULE_ERRORS["thumbnail"] = f"{type(_e).__name__}: {_e}"
+
 app = FastAPI(title="Calm Drama Stories - Render Service")
 
 STORAGE_DIR = "/data/storage"
@@ -884,6 +890,53 @@ def visual_preview(req: VisualPreviewRequest):
             os.remove(tmp)
 
 
+class ThumbnailRequest(BaseModel):
+    entity_a: str
+    entity_b: str
+    value_a: float = 0
+    value_b: float = 0
+    subject: str = "cost of living"
+    hook: str = ""            # 2-4 words, a question, never the answer
+    photo_query_a: str = ""   # override the derived Pexels query
+    photo_query_b: str = ""
+    layout: str = ""          # force split/diagonal/hero; normally left empty
+
+
+@app.post("/thumbnail")
+def make_thumbnail(req: ThumbnailRequest):
+    """Draw the YouTube thumbnail and return the PNG.
+
+    Separate from /visual because the constraints are different: an in-video
+    card is read at full screen for five seconds, a thumbnail is read at 120
+    pixels in a fraction of one. thumbnail.py enforces its own minimum text
+    size and measures every string against the real font before drawing.
+
+    `validate` is returned rather than raised on: a thumbnail with one label
+    slightly wide is still far better than no thumbnail at all, and the
+    warning surfaces in the n8n run so it is not silent.
+    """
+    if thumbnail is None:
+        raise HTTPException(500, "thumbnail module failed to import: "
+                                 + _MODULE_ERRORS.get("thumbnail", "unknown"))
+    payload = {k: v for k, v in req.dict().items() if v not in ("", None)}
+    try:
+        png, layout, spec = thumbnail.render_png(payload)
+    except Exception as e:
+        raise HTTPException(500, f"thumbnail render failed: {type(e).__name__}: {e}")
+    problems = thumbnail.validate()
+    headers = {
+        "X-Thumb-Layout": layout,
+        "X-Thumb-Hook": spec.get("hook", ""),
+        # which photos were actually used, so a wrong-looking picture can be
+        # traced to its query instead of guessed at
+        "X-Thumb-Query-A": spec.get("qa", "")[:120],
+        "X-Thumb-Query-B": spec.get("qb", "")[:120],
+        "X-Thumb-Photos": "%s/%s" % (int(bool(spec.get("pa"))), int(bool(spec.get("pb")))),
+        "X-Thumb-Warnings": ("; ".join(problems)[:400] or "none"),
+    }
+    return Response(content=png, media_type="image/png", headers=headers)
+
+
 # ============================================================
 # 4. CLEANUP  — free up storage/compute once files are no longer needed
 # ============================================================
@@ -1085,7 +1138,12 @@ def health():
         "modules": {
             "visuals": "ok" if visuals is not None else _MODULE_ERRORS.get("visuals"),
             "qc_gate": "ok" if qc_gate is not None else _MODULE_ERRORS.get("qc_gate"),
+            "thumbnail": "ok" if thumbnail is not None else _MODULE_ERRORS.get("thumbnail"),
         },
         "music_bed": _bed_describe(),
         "pexels_key": bool(os.environ.get("PEXELS_API_KEY")),
+        # names the face the thumbnails will actually draw with, so a missing
+        # font package shows up here instead of in a published thumbnail
+        "thumbnail_font": (getattr(thumbnail, "_FP", None) or "NONE")
+                          if thumbnail is not None else "module not loaded",
     }
