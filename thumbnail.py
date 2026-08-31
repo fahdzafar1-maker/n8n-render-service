@@ -425,10 +425,16 @@ def _defs():
         '<stop offset="0.45" stop-color="%s" stop-opacity="0.80"/>'
         '<stop offset="1" stop-color="%s" stop-opacity="0.96"/></linearGradient>'
         # top scrim, lighter: the numbers need contrast without hiding the photo
+        # This used to end at 0.10 opacity and then stop dead, which drew a
+        # visible horizontal seam right across the photograph at y=299 - a
+        # 22-level step, measured on the first live render. It fades to zero
+        # now, and the darkening it provides for the numbers is carried by
+        # the middle stop instead of by the cut-off.
         '<linearGradient id="top" x1="0" y1="0" x2="0" y2="1">'
-        '<stop offset="0" stop-color="%s" stop-opacity="0.62"/>'
-        '<stop offset="1" stop-color="%s" stop-opacity="0.10"/></linearGradient>'
-        '</defs>' % (SHADE, SHADE, SHADE, SHADE, SHADE)
+        '<stop offset="0" stop-color="%s" stop-opacity="0.70"/>'
+        '<stop offset="0.62" stop-color="%s" stop-opacity="0.30"/>'
+        '<stop offset="1" stop-color="%s" stop-opacity="0"/></linearGradient>'
+        '</defs>' % (SHADE, SHADE, SHADE, SHADE, SHADE, SHADE)
     )
 
 
@@ -544,7 +550,7 @@ def _lay_split(d):
         _defs(),
         _photo_half(d["pa"], 0, half, WARM),
         _photo_half(d["pb"], half, W - half, COOL),
-        '<rect x="0" y="0" width="%d" height="300" fill="url(#top)"/>' % W,
+        '<rect x="0" y="0" width="%d" height="540" fill="url(#top)"/>' % W,
         '<rect x="%d" y="0" width="8" height="%d" fill="%s" opacity="0.92"/>' % (half - 4, H, SHADE),
         # context, small but never under the floor
         '<rect x="%d" y="26" width="%d" height="74" rx="10" fill="%s" opacity="0.86"/>'
