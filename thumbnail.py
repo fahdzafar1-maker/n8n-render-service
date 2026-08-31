@@ -55,8 +55,19 @@ COOL = "#3f9bff"           # right-side grade
 # answer" rule: it marks which PRICE is lower, which anyone can already see by
 # reading the digits. It does not say which side leaves you richer overall -
 # that verdict is the video, and the frame still withholds it.
-HIGH = "#ff6b5e"           # the dearer figure
-LOW  = "#4ade80"           # the cheaper figure
+HIGH = "#ff6b5e"           # the worse figure for the viewer
+LOW  = "#4ade80"           # the better figure for the viewer
+
+# For a COST, the bigger number is the bad one. For INCOME it is the good one -
+# and the first version coloured Utah's $97K red against Ohio's $72K green on a
+# median-household-income comparison, which reads as exactly backwards.
+EARNINGS_RE = re.compile(
+    r"\b(income|salary|salaries|wage|wages|pay|earnings|paycheck|takehome|"
+    r"take-home|savings|surplus)\b", re.I)
+
+
+def bigger_is_better(subject):
+    return bool(EARNINGS_RE.search(str(subject or "")))
 
 MIN_TEXT = 56              # unreadable below this in a phone feed
 BADGE = (1112, 656, 1272, 712)      # YouTube stamps the duration here
@@ -524,6 +535,8 @@ def _lay_split(d):
     lab = _context_label(d["subject"])
     ls = fit(lab, 620, 62, MIN_TEXT)
     ico = ICONS[icon_for(d["subject"])]
+    up_is_good = bigger_is_better(d["subject"])
+    good, bad = (LOW, HIGH) if up_is_good else (HIGH, LOW)
 
     lx, rx = 300, W - 300
     face_svg, face_w = face_layer(x_right=True, height=244)
@@ -541,10 +554,10 @@ def _lay_split(d):
         # icon, then name, then number - the eye ladder the review asked for
         ico(lx, 170, 62, WARM),
         _t(lx, 258, la, ns, INK),
-        _t(lx, 424, va, vs, HIGH if d["va"] >= d["vb"] else LOW),
+        _t(lx, 424, va, vs, good if d["va"] >= d["vb"] else bad),
         ico(rx, 170, 62, COOL),
         _t(rx, 258, lb, ns, INK),
-        _t(rx, 424, vb, vs, HIGH if d["vb"] > d["va"] else LOW),
+        _t(rx, 424, vb, vs, good if d["vb"] > d["va"] else bad),
         _vs_badge(W // 2, 372),
         _hook_band(d["hook"], avoid_right=face_w),
         face_svg,
