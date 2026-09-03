@@ -5,6 +5,8 @@ import uuid
 import shutil
 import tempfile
 import subprocess
+import sys
+import traceback
 import urllib.request
 import requests
 import numpy as np
@@ -642,8 +644,113 @@ def _audio_report(path: str) -> dict:
     return rep
 
 
+# Changed by hand on every deploy that matters. Its whole job is to answer one
+# question in one look: IS THE CODE I JUST PUSHED THE CODE THAT IS RUNNING?
+# Twice now a fix was shipped, the same error came back unchanged, and there was
+# no way to tell whether the deploy had landed or the fix was wrong. It appears
+# on the health endpoint and on every failed render.
+BUILD = "2026-09-03 payload-guards+traceback"
+
+
+def _where(limit: int = 6) -> str:
+    """The tail of the current traceback, as file:line -> code."""
+    try:
+        frames = traceback.extract_tb(sys.exc_info()[2])[-limit:]
+        return " | ".join(
+            "%s:%d in %s -> %s" % (os.path.basename(f.filename), f.lineno, f.name, (f.line or "").strip()[:80])
+            for f in frames
+        )
+    except Exception:
+        return "(traceback unavailable)"
+
+
+def _num(container: dict, key: str, default: float, where: str = "payload") -> float:
+    """A number out of the payload, treating present-but-null as absent.
+
+    `d.get(k, default)` returns the default only when the key is MISSING. When
+    the key is there holding null - which is what a JSON payload built by a
+    workflow does the moment one expression resolves to nothing - it hands back
+    None, and the float() two characters later dies with:
+
+        float() argument must be a string or a real number, not 'NoneType'
+
+    That message names no field, no image and no stage. It cost a full
+    debugging round trip to not find out where it came from. Anything numeric
+    that arrives from outside this process goes through here, and if it is
+    genuinely unusable the error says which key and what it held.
+    """
+    v = container.get(key) if isinstance(container, dict) else None
+    if v is None or v == "":
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "%s.%s is %r, which is not a number. Expected something like %r."
+            % (where, key, v, default)
+        )
+
+
+def _check_payload(payload: dict) -> None:
+    """Refuse a payload that cannot render, and say exactly what is wrong.
+
+    Every check here replaces a crash that used to happen somewhere deeper,
+    with a message that described the symptom rather than the cause.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("payload is not an object.")
+    if not payload.get("audio_url"):
+        raise ValueError("payload.audio_url is missing - there is no voiceover to render against.")
+
+    images = payload.get("images")
+    if not images:
+        raise ValueError(
+            "payload.images is empty. The workflow reached the render step with "
+            "no shots, which normally means the Visuals row it read had no "
+            "shots list - not that the render is broken."
+        )
+
+    problems = []
+    for i, img in enumerate(images):
+        if not isinstance(img, dict):
+            problems.append("images[%d] is not an object" % i)
+            continue
+        if img.get("chapter_number") is None:
+            problems.append("images[%d].chapter_number is null" % i)
+        d = img.get("duration")
+        if d is not None:
+            try:
+                if float(d) <= 0:
+                    problems.append("images[%d].duration is %r (must be > 0)" % (i, d))
+            except (TypeError, ValueError):
+                problems.append("images[%d].duration is %r, not a number" % (i, d))
+        spec = img.get("visual_spec")
+        if spec is None and not img.get("image_url"):
+            problems.append("images[%d] has neither visual_spec nor image_url" % i)
+        if isinstance(spec, dict):
+            t = spec.get("type")
+            if not t:
+                problems.append("images[%d].visual_spec has no type" % i)
+            elif t in ("bar_pair", "photo_split"):
+                for k in ("value_a", "value_b"):
+                    if spec.get(k) is None:
+                        problems.append(
+                            "images[%d].visual_spec.%s is null - a %s card cannot "
+                            "draw a bar without both figures" % (i, k, t))
+        if len(problems) >= 12:
+            problems.append("... and possibly more; fix these first")
+            break
+
+    if problems:
+        raise ValueError(
+            "The render payload has %d problem(s):\n  - %s"
+            % (len(problems), "\n  - ".join(problems))
+        )
+
+
 def _run_render(task_id: str, payload: dict):
     try:
+        _check_payload(payload)
         work_dir = os.path.join(STORAGE_DIR, task_id)
         os.makedirs(work_dir, exist_ok=True)
         # --- download voiceover audio ---
@@ -654,7 +761,7 @@ def _run_render(task_id: str, payload: dict):
             "-of", "default=noprint_wrappers=1:nokey=1", audio_path
         ]).decode().strip())
 
-        images = sorted(payload["images"], key=lambda x: x["chapter_number"])
+        images = sorted(payload["images"], key=lambda x: float(x.get("chapter_number") or 0))
         n = len(images)
 
         # --- per-shot durations -------------------------------------------
@@ -667,7 +774,7 @@ def _run_render(task_id: str, payload: dict):
         #
         # No durations supplied -> even split, exactly as before. That is what
         # keeps the older storytelling pipeline working without any change.
-        raw = [float(img.get("duration") or 0) for img in images]
+        raw = [_num(img, "duration", 0, "images[%d]" % i) for i, img in enumerate(images)]
         if raw and all(r > 0 for r in raw):
             scale = duration / sum(raw)
             durations = [r * scale for r in raw]
@@ -704,7 +811,7 @@ def _run_render(task_id: str, payload: dict):
         sc = payload.get("subtitle_config") or {}
         _write_ass(payload["subtitle_words"], ass_path, w, h,
                    words_per_chunk=5,
-                   max_chars=int(sc.get("max_chars", 32)),
+                   max_chars=int(_num(sc, "max_chars", 32, "subtitle_config")),
                    phrase_break=str(sc.get("break_on", "phrase")) == "phrase")
 
         # Build the gradient overlay once (reused for every segment).
@@ -772,8 +879,8 @@ def _run_render(task_id: str, payload: dict):
         # against everything beside it in the sidebar.
         final_path = os.path.join(work_dir, "final.mp4")
         master = payload.get("audio_master") or {}
-        lufs = float(master.get("loudness_lufs", -14))
-        tp = float(master.get("true_peak_dbtp", -1))
+        lufs = _num(master, "loudness_lufs", -14, "audio_master")
+        tp = _num(master, "true_peak_dbtp", -1, "audio_master")
         want_bed = bool(master.get("music_bed", True))
 
         # resolve_bed() probes the file and falls back to a generated one, so a
@@ -786,7 +893,7 @@ def _run_render(task_id: str, payload: dict):
             # the voice in the finished file: felt, not heard. The old default of
             # -22 left it only 5.5 dB down, where the music competes with the
             # narration instead of supporting it.
-            bed_db = float(master.get("music_bed_lufs", -42)) - lufs   # relative to voice
+            bed_db = _num(master, "music_bed_lufs", -42, "audio_master") - lufs   # relative to voice
             cmd = [
                 "ffmpeg", "-y",
                 "-i", concat_video_path,
@@ -842,9 +949,30 @@ def _run_render(task_id: str, payload: dict):
             "duration_seconds": round(duration, 1),
         }
     except subprocess.CalledProcessError as e:
-        render_tasks[task_id] = {"status": "failed", "error": e.stderr.decode()[-800:] if e.stderr else str(e)}
+        render_tasks[task_id] = {
+            "status": "failed",
+            "build": BUILD,
+            "error": (e.stderr.decode()[-800:] if e.stderr else str(e)),
+            "traceback": _where(),
+        }
     except Exception as e:
-        render_tasks[task_id] = {"status": "failed", "error": str(e)}
+        # str(e) ALONE THREW AWAY THE ONLY USEFUL PART.
+        #
+        # A TypeError reads "float() argument must be a string or a real
+        # number, not 'NoneType'" and nothing else - no file, no line, no
+        # stage. Two full debugging rounds were spent on that message without
+        # being able to say which of the fourteen float() calls in this file
+        # produced it. The traceback was right there and this line discarded
+        # it.
+        #
+        # The build string goes out too, so "did my deploy actually land?" is
+        # answerable from the error itself instead of being the next guess.
+        render_tasks[task_id] = {
+            "status": "failed",
+            "build": BUILD,
+            "error": "%s: %s" % (type(e).__name__, e),
+            "traceback": _where(),
+        }
     finally:
         # Always clean up the working folder (source images, per-chapter video
         # segments, raw audio) — whether the render succeeded or failed. Only
@@ -1135,6 +1263,7 @@ def health():
     """
     return {
         "status": "ok" if not _MODULE_ERRORS else "degraded",
+        "build": BUILD,
         "modules": {
             "visuals": "ok" if visuals is not None else _MODULE_ERRORS.get("visuals"),
             "qc_gate": "ok" if qc_gate is not None else _MODULE_ERRORS.get("qc_gate"),
