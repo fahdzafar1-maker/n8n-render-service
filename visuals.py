@@ -152,6 +152,41 @@ def flag_data_uri(name, width=320):
 # ==================================================================
 #  R011 — photographs
 # ==================================================================
+def _enhance(raw):
+    """Sharpen and grade a downloaded photograph.
+
+    vidIQ's thumbnail scorer was run against five real videos in this niche on
+    11 Sep 2026. `blur_score_log` - plain optical sharpness - was the largest
+    single positive contributor in every one of them (up to +51 points of
+    impact), and `clip_energy_score` ("the image feels a bit low-energy: increase
+    colour saturation") was a named negative on the ones that scored worst.
+
+    Both are fixable in two lines here, before the photograph ever reaches a
+    card. A JPEG that has been resized by Pexels' CDN is always slightly soft;
+    an unsharp mask puts the edge back without the halo that a plain sharpen
+    filter leaves.
+
+    Never raises. A photograph that cannot be processed is returned exactly as
+    it arrived - the render must not fail over a grading step.
+    """
+    try:
+        import io
+        from PIL import Image, ImageFilter, ImageEnhance
+        im = Image.open(io.BytesIO(raw))
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        # radius/percent/threshold: gentle. The threshold keeps flat areas like
+        # sky and skin from picking up grain.
+        im = im.filter(ImageFilter.UnsharpMask(radius=2, percent=115, threshold=3))
+        im = ImageEnhance.Color(im).enhance(1.18)      # +18% saturation
+        im = ImageEnhance.Contrast(im).enhance(1.10)   # +10% contrast
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=92, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return raw
+
+
 def photo_data_uri(query, index=0):
     """One Pexels landscape photo for a query, as a data URI.
 
@@ -180,7 +215,11 @@ def photo_data_uri(query, index=0):
         return _PHOTO_CACHE[key]
 
     os.makedirs(PHOTO_DIR, exist_ok=True)
-    disk = os.path.join(PHOTO_DIR, hashlib.md5(key.encode()).hexdigest() + ".jpg")
+    # The "v2" in the cache key is deliberate. Photographs are now sharpened and
+    # graded on the way in (see _enhance below), and the old cache holds the
+    # un-processed versions. Without a new key those stale files would be served
+    # forever and the change would appear to do nothing.
+    disk = os.path.join(PHOTO_DIR, hashlib.md5(("v2#" + key).encode()).hexdigest() + ".jpg")
 
     raw = None
     if os.path.exists(disk):
@@ -211,10 +250,16 @@ def photo_data_uri(query, index=0):
             if not photos:
                 return None
             pick = photos[idx % len(photos)]      # wraps if the search is thin
-            src = pick["src"].get("large2x") or pick["src"].get("large")
+            # original first: large2x tops out around 1880px, and a 1920-wide
+            # frame was upscaling it by a few percent - which is exactly the
+            # softness the thumbnail scorer punishes. original is already on
+            # Pexels' CDN, so this costs nothing but bytes.
+            src = (pick["src"].get("original")
+                   or pick["src"].get("large2x")
+                   or pick["src"].get("large"))
             img = requests.get(src, timeout=40)
             img.raise_for_status()
-            raw = img.content
+            raw = _enhance(img.content)
             try:
                 with open(disk, "wb") as f:
                     f.write(raw)
