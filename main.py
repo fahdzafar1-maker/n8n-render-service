@@ -841,15 +841,38 @@ def _run_render(task_id: str, payload: dict):
             # like a phone video of a monitor. Charts, stats and cards hold
             # perfectly still. Only photos and maps move, and only gently.
             motion = str(images[i].get("camera_motion") or "none").lower()
+
+            # --- fit: how a source image meets a frame of a different shape ---
+            # "contain" (default) letterboxes - the whole card stays visible,
+            # which is what a 16:9 data card needs in a 16:9 frame.
+            #
+            # "cover" fills the frame and crops the overflow. This exists for
+            # Shorts: a 1920x1080 photo dropped into a 1080x1920 frame under
+            # "contain" leaves two 656px navy bands, roughly two thirds of a
+            # phone screen showing nothing. Under "cover" the photo fills it.
+            #
+            # The scale expressions below also fix a real bug: the two zoom
+            # branches used a bare scale={w*2}:{h*2}, which does NOT preserve
+            # aspect ratio. In a 16:9 frame the source was already 16:9 so
+            # nothing showed; the first 9:16 render would have stretched every
+            # photo to half its width. force_original_aspect_ratio + crop keeps
+            # the geometry honest at any frame shape.
+            fit = str(images[i].get("fit") or "contain").lower()
+            if fit == "cover":
+                fill = (f"scale={{W}}:{{H}}:force_original_aspect_ratio=increase,"
+                        f"crop={{W}}:{{H}}")
+            else:
+                fill = (f"scale={{W}}:{{H}}:force_original_aspect_ratio=decrease,"
+                        f"pad={{W}}:{{H}}:(ow-iw)/2:(oh-ih)/2:color=0x0f172a")
+
             if motion == "slow_zoom":
-                chain = (f"scale={w*2}:{h*2},"
+                chain = (fill.format(W=w * 2, H=h * 2) + "," +
                          f"zoompan=z='min(zoom+0.00035,1.06)':d={frames}:s={w}x{h}:fps={fps}")
             elif motion == "slow_zoom_out":
-                chain = (f"scale={w*2}:{h*2},"
+                chain = (fill.format(W=w * 2, H=h * 2) + "," +
                          f"zoompan=z='if(lte(on,1),1.06,max(1.0,zoom-0.00035))':d={frames}:s={w}x{h}:fps={fps}")
             else:
-                chain = f"scale={w}:{h}:force_original_aspect_ratio=decrease," \
-                        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=0x0f172a,fps={fps}"
+                chain = fill.format(W=w, H=h) + f",fps={fps}"
             subprocess.run([
                 "ffmpeg", "-y",
                 "-loop", "1", "-i", img_path,
