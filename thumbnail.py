@@ -29,6 +29,7 @@ Engineering constraints, unchanged:
 
 import base64
 import hashlib
+import math
 import os
 import re
 
@@ -66,8 +67,21 @@ EARNINGS_RE = re.compile(
     r"take-home|savings|surplus)\b", re.I)
 
 
+# "The salary you need to survive" is one of the channel's strongest title
+# shapes - and it contains the word "salary", so EARNINGS_RE matched it and the
+# frame coloured the HIGHER figure green. On a threshold metric that is exactly
+# backwards: needing $128K to survive in California is the bad news, not the
+# good news. A salary you EARN is income; a salary you NEED is a cost.
+THRESHOLD_RE = re.compile(
+    r"\b(needed|need|required|require|to survive|to afford|to live|"
+    r"to break even|to get by|minimum)\b", re.I)
+
+
 def bigger_is_better(subject):
-    return bool(EARNINGS_RE.search(str(subject or "")))
+    s = str(subject or "")
+    if THRESHOLD_RE.search(s):
+        return False
+    return bool(EARNINGS_RE.search(s))
 
 MIN_TEXT = 56              # unreadable below this in a phone feed
 BADGE = (1112, 656, 1272, 712)      # YouTube stamps the duration here
@@ -353,11 +367,11 @@ def _context_label(text):
     t = re.sub(r"\s+", " ", t).strip() or "COST OF LIVING"
     # "Property tax on a median home" truncated to "PROPERTY TAX ON" - a label
     # ending on a preposition reads as a sentence that got cut off.
-    t = re.sub(r"\b(ON|OF|FOR|PER|A|AN|THE|IN)\b\s*$", "", t).strip()
+    t = re.sub(r"\b(ON|OF|FOR|PER|A|AN|THE|IN|TO|WITH|AND|OR|BY|AT|FROM)\b\s*$", "", t).strip()
     words = t.split()
     if len(words) > 3:
         t = " ".join(words[:3])
-    return re.sub(r"\b(ON|OF|FOR|PER|A|AN|THE|IN)\b\s*$", "", t).strip()
+    return re.sub(r"\b(ON|OF|FOR|PER|A|AN|THE|IN|TO|WITH|AND|OR|BY|AT|FROM)\b\s*$", "", t).strip()
 
 
 # ------------------------------------------------------------------ drawing
@@ -494,6 +508,85 @@ def face_layer(x_right=True, height=330):
             w)
 
 
+def _shock_is_a(d):
+    """Which side carries the shock - the expensive one when cheaper is better,
+    the poorer one when bigger is better. That is the number the title is
+    arguing about, so that is where the arrow points."""
+    return (d["va"] < d["vb"]) if bigger_is_better(d["subject"]) else (d["va"] > d["vb"])
+
+
+def _arrow_between(x, num_baseline, num_size, hook, avoid_right, lean, colour=None):
+    """Fit the arrow into the gap between the number and the hook band.
+
+    A fixed y does not work and the test rig proved it twice. `fit()` shrinks a
+    long figure but leaves a short one ("$512", "$185") at the full 168px, so
+    the bottom of the digits moves by nearly 30px depending on the topic - and
+    the hook line moves too, because its size depends on how many words it has.
+    A constant that clears both on one topic collides on the next. This is the
+    same trap the small-number/state-name collision fell into earlier.
+
+    So the gap is measured from the two things that actually bound it, and the
+    arrow is sized to what is left. If there is genuinely no room, no arrow is
+    drawn - a missing cue is a lost point, a colliding one is a broken frame.
+    """
+    num_bottom = num_baseline + num_size * 0.14
+    hook_size = fit(hook, W - 110 - avoid_right, 108, MIN_TEXT)
+    hook_top = 646 - hook_size * 0.78
+    top = num_bottom + 28
+    length = int(hook_top - 28 - top)
+    if length < 46:
+        return ""
+    return _arrow(x, int(top), colour=colour, length=min(length, 92), lean=lean)
+
+
+def _arrow(tip_x, tip_y, colour=None, length=96, lean=56):
+    """A thick arrow pointing UP at the number that carries the shock.
+
+    vidIQ's thumbnail scorer names this one outright. Scoring five real videos
+    in this niche on 11 Sep 2026 returned, on the weakest of them:
+
+        clip_arrow_sim - "No clear visual guidance for the viewer's eye"
+        tip: "Add an arrow or other visual cue to point toward the key element"
+
+    Our thumbnails had no such cue at all, so this was points being left on the
+    table for the sake of one path. It is drawn short and very thick on purpose:
+    at the 120px preview that decides most clicks, a thin arrow vanishes and a
+    long one reads as a scribble.
+
+    It sits in the band between the numbers and the hook, which is empty in
+    every layout, so it collides with nothing.
+    """
+    c = colour or WARM
+    x0, y0 = tip_x + lean, tip_y + length      # tail, below and to the side
+    x1, y1 = tip_x, tip_y                      # tip
+    # Head: an isosceles triangle whose apex is the tip, aligned to the shaft.
+    dx, dy = x1 - x0, y1 - y0
+    n = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / n, dy / n
+    px, py = -uy, ux                           # perpendicular
+    hl, hw = 44.0, 25.0                        # head length / half-width
+    bx, by = x1 - ux * hl, y1 - uy * hl
+    head = "%.0f,%.0f %.0f,%.0f %.0f,%.0f" % (
+        x1, y1, bx + px * hw, by + py * hw, bx - px * hw, by - py * hw)
+
+    _BOXES.append({"text": "[arrow]", "size": MIN_TEXT,
+                   "x0": min(x0, x1) - hw, "x1": max(x0, x1) + hw,
+                   "y0": min(y0, y1), "y1": max(y0, y1)})
+
+    return (
+        # dark backing stroke first, so the arrow survives a light photograph
+        '<path d="M%.0f %.0f L%.0f %.0f" stroke="%s" stroke-width="26" '
+        'stroke-linecap="round" fill="none" opacity="0.55"/>'
+        '<path d="M%.0f %.0f L%.0f %.0f" stroke="%s" stroke-width="15" '
+        'stroke-linecap="round" fill="none"/>'
+        '<polygon points="%s" fill="%s" stroke="%s" stroke-width="5" '
+        'stroke-linejoin="round"/>'
+        % (x0, y0, bx, by, SHADE,
+           x0, y0, bx, by, c,
+           head, c, SHADE)
+    )
+
+
 def _hook_band(hook, top=498, avoid_right=0):
     """The hook, with one word carried in amber.
 
@@ -545,7 +638,27 @@ def _lay_split(d):
     good, bad = (LOW, HIGH) if up_is_good else (HIGH, LOW)
 
     lx, rx = 300, W - 300
-    face_svg, face_w = face_layer(x_right=True, height=244)
+    # Face trimmed 244 -> 200. `clip_face_presence` came back as a NEGATIVE on
+    # the 355K-view competitor thumbnail we scored ("Face dominates the frame",
+    # -6 points). Ours is a corner cut-out rather than a portrait, so it was
+    # never going to be penalised as hard - but the numbers are the product
+    # here, and 44px back is 44px more photograph behind them.
+    face_svg, face_w = face_layer(x_right=True, height=200)
+
+    # The arrow points at the side that carries the shock: the expensive one
+    # when cheaper is better, the poor one when bigger is better. That is the
+    # number the title is arguing about, so that is where the eye should go.
+    # Placement was not chosen by eye. The first attempt sat the arrow at
+    # y=506 and validate() caught it overlapping the hook text on two of four
+    # test layouts. A 64-point sweep of (tip_y, length, lean) against four real
+    # topics found 16 clean combinations; this is the largest of them, because
+    # at a 120px preview a small arrow is no arrow at all.
+    a_is_shock = _shock_is_a(d)
+    arrow_x = lx if a_is_shock else rx
+    # Always angle inward, so the arrow never leans off the edge of the frame.
+    arrow_svg = _arrow_between(arrow_x, 424, vs, d["hook"], face_w,
+                               lean=(64 if a_is_shock else -64))
+
     return "".join([
         _defs(),
         _photo_half(d["pa"], 0, half, WARM),
@@ -566,6 +679,7 @@ def _lay_split(d):
         _t(rx, 424, vb, vs, good if d["vb"] > d["va"] else bad),
         _vs_badge(W // 2, 372),
         _hook_band(d["hook"], avoid_right=face_w),
+        arrow_svg,
         face_svg,
     ])
 
@@ -590,6 +704,11 @@ def _lay_diagonal(d):
         _t(958, 148, lb, ns),
         _t(958, 306, vb, vs),
         _hook_band(d["hook"]),
+        # The eye cue belongs on every layout, not just `split` - the scorer
+        # does not know which one it is looking at. Numbers sit higher here
+        # (baseline 306), so the arrow sits higher too.
+        _arrow_between(292 if _shock_is_a(d) else 958, 306, vs, d["hook"], 0,
+                       lean=(64 if _shock_is_a(d) else -64)),
     ])
 
 
@@ -612,10 +731,123 @@ def _lay_hero(d):
         _t(970, 322, vb, vs),
         '<rect x="%d" y="188" width="7" height="150" fill="%s" opacity="0.9"/>' % (W // 2 - 3, INK),
         _hook_band(d["hook"]),
+        _arrow_between(310 if _shock_is_a(d) else 970, 322, vs, d["hook"], 0,
+                       lean=(64 if _shock_is_a(d) else -64)),
     ])
 
 
-LAYOUTS = {"split": _lay_split, "diagonal": _lay_diagonal, "hero": _lay_hero}
+_ABBR = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE",
+    "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ",
+    "new mexico": "NM", "new york": "NY", "north carolina": "NC",
+    "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR",
+    "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+    "district of columbia": "DC", "puerto rico": "PR",
+}
+
+
+def chip_name(name):
+    """Two letters beat a truncated word on a small chip.
+
+    `short_name` cut "Massachusetts" to "MASSACHUSETT", which then measured
+    wider than the chip at the 56px floor and ran off the frame - the test rig
+    caught it on four of six topics. A postal code is two characters, always
+    fits, and every American reads it instantly.
+    """
+    k = str(name or "").strip().lower()
+    return _ABBR.get(k) or short_name(name, 11)
+
+
+def _lay_list(d):
+    """The list format: one metric, many places, one shocking number.
+
+    This is the layout the whole strategy turns on, and it is deliberately NOT
+    a map. A US map with ten states picked out is legible on a monitor and a
+    grey smudge at the 120px preview that actually decides the click - and
+    `us_paths.json` in this repo is a four-entry stub of axis-aligned squares
+    anyway, so the map card has never drawn a real country.
+
+    What survives 120px is a number. So: the worst figure enormous, the count
+    badge that promises the rest, three runners-up small enough to read as
+    "there are more of these", and the hook. One photograph behind all of it.
+    """
+    places = d["places"]
+    worst = places[0]
+    rest = places[1:4]
+    n = d["count"]
+
+    badge = ("%d STATES" % n) if n and n > 2 else "EVERY STATE"
+    bs = fit(badge, 330, 58, MIN_TEXT)
+    bw = text_width(badge, bs) + 52
+
+    lab = _context_label(d["subject"])
+    ls = fit(lab, 1180 - (54 + bw + 26), 54, MIN_TEXT)
+
+    # Left column is the shock; right column is the proof there are more.
+    # Kept apart on x so a long figure can never reach the chips.
+    big = money(worst["value"])
+    bigs = fit(big, 690, 184, 110)
+    wname = short_name(worst["name"], 14)
+    wns = fit(wname, 690, 74, MIN_TEXT)
+
+    face_svg, face_w = face_layer(x_right=True, height=200)
+
+    out = [
+        _defs(),
+        _photo_half(d["pa"], 0, W, WARM, tint_op=0.10),
+        '<rect x="0" y="0" width="%d" height="%d" fill="%s" opacity="0.54"/>' % (W, H, SHADE),
+        '<rect x="0" y="0" width="%d" height="260" fill="url(#top)"/>' % W,
+        # count badge, then the category beside it on the same line - the two
+        # together say "this many places, this thing" in one glance.
+        '<rect x="54" y="34" width="%.0f" height="78" rx="14" fill="%s"/>' % (bw, WARM),
+        _t(54 + bw / 2, 90, badge, bs, SHADE),
+        _t(54 + bw + 26, 90, lab, ls, INK, anchor="start"),
+        # the shock
+        _t(392, 300, big, bigs, HIGH),
+        # 396 -> 412. At 184px the figure's descender reaches y=326 and the
+        # name's cap top was at 343: a 17px gap, under validate()'s 26px floor,
+        # and it failed on every single test topic. Measured, not nudged.
+        _t(392, 412, wname, wns, INK),
+    ]
+
+    # the runners-up: postal code + figure. The name is fitted into whatever
+    # the FIGURE leaves, not into a fixed 150px - "JACKSON" at the 56px floor
+    # is wider than that and printed straight through "$1.9M".
+    cy = 196
+    for p in rest:
+        v = money(p["value"])
+        nm = chip_name(p["name"])
+        s2 = fit(v, 190, 58, MIN_TEXT)
+        room = 304 - text_width(v, s2) - 30
+        s1 = fit(nm, room, 56, MIN_TEXT)
+        while text_width(nm, s1) > room and len(nm) > 2:
+            nm = nm[:-1]                      # last resort: shorten the label
+        out.append('<rect x="872" y="%d" width="356" height="80" rx="12" fill="%s" opacity="0.82"/>'
+                   % (cy - 56, SHADE))
+        out.append(_t(898, cy, nm, s1, COOL, anchor="start"))
+        out.append(_t(1202, cy, v, s2, INK, anchor="end"))
+        cy += 96
+
+    out.append(_hook_band(d["hook"], avoid_right=face_w))
+    # The arrow measures from the NAME, not the number - the name is the lowest
+    # thing in the left column, and pointing from the number's baseline put the
+    # shaft straight through it.
+    out.append(_arrow_between(392, 412, wns, d["hook"], face_w, lean=64))
+    out.append(face_svg)
+    return "".join(out)
+
+
+LAYOUTS = {"split": _lay_split, "diagonal": _lay_diagonal, "hero": _lay_hero,
+           "list": _lay_list}
 
 
 def choose_layout(d):
@@ -651,8 +883,13 @@ _ANSWER_WORDS = re.compile(
 
 # A repeated phrase stops working within about three uploads, so the fallback
 # rotates instead of stamping one line on every video that needs it.
-_FALLBACKS = ["WHO ACTUALLY WINS?", "NOT WHAT YOU THINK", "WORTH IT?",
-              "CHEAPER = EASIER?", "WHO CAN AFFORD IT?", "THE REAL COST"]
+# Every fallback is three words or fewer, because clean_hook() now rejects a
+# four-word hook - and a fallback list that breaks the rule it exists to
+# enforce sends a rejected hook straight back out as another rejected hook.
+# "NOT WHAT YOU THINK" and "WHO CAN AFFORD IT?" were exactly that, and the
+# test rig caught them the first time the limit moved to three.
+_FALLBACKS = ["WHO ACTUALLY WINS?", "WORTH IT?", "CHEAPER = EASIER?",
+              "MORE FOR LESS?", "WHY SO BIG?", "AT WHAT COST?"]
 
 
 def clean_hook(hook, a, b):
@@ -671,8 +908,14 @@ def clean_hook(hook, a, b):
     h = re.sub(r"\s+", " ", str(hook or "")).strip().upper().strip(".!")
     words = [w for w in re.split(r"\s+", h) if w]
     asks = h.endswith("?")
+    # Four words down to three. vidIQ's scorer flagged `clip_text_readability_score`
+    # - "Text is difficult to read at small sizes: use bold fonts, FEWER WORDS,
+    # and high contrast" - as an 11-point negative on a competitor thumbnail.
+    # Every word on the frame competes with the two numbers, which are the
+    # actual product. Three is enough for "WHO ACTUALLY WINS?"; four was enough
+    # for a sentence, and a sentence is what we are trying not to draw.
     bad = (not h
-           or len(words) > 4
+           or len(words) > 3
            or (not asks and _ANSWER_WORDS.search(h))
            or str(a).upper() in h
            or str(b).upper() in h)
@@ -682,12 +925,59 @@ def clean_hook(hook, a, b):
     return _FALLBACKS[seed % len(_FALLBACKS)]
 
 
+def _norm_places(payload, subject):
+    """Pull the list format's places into one shape, worst first.
+
+    "Worst" is whichever end of the scale hurts: the highest figure for a cost,
+    the lowest for real earnings. The thumbnail leads on that number because it
+    is the one the title is arguing about.
+    """
+    raw = payload.get("places") or []
+    out = []
+    for p in raw:
+        try:
+            out.append({"name": str(p.get("name") or p.get("entity") or "").strip(),
+                        "value": float(p.get("value"))})
+        except Exception:
+            continue
+    out = [p for p in out if p["name"]]
+    if not out:
+        return []
+    out.sort(key=lambda p: p["value"], reverse=not bigger_is_better(subject))
+    return out
+
+
 def build_spec(payload):
+    subject = payload.get("subject") or "cost of living"
+
+    # --- list format: one metric, many places -----------------------------
+    # The whole point of the strategy change. A two-state split has an audience
+    # of two states; "these 10" has an audience of ten, and "every state" has
+    # all of them. The layout is different enough that it gets its own branch
+    # rather than being squeezed into the a/b shape.
+    places = _norm_places(payload, subject)
+    if places:
+        q = payload.get("photo_query") or photo_query(places[0]["name"], subject)
+        worst = places[0]["name"]
+        return {
+            "places": places,
+            "count": int(payload.get("count") or len(places)),
+            "subject": subject,
+            # clean_hook needs two names to keep off the frame; on a list the
+            # only name worth banning is the one the big number belongs to.
+            "hook": clean_hook(payload.get("hook"), worst, worst),
+            "pa": fetch_photo(q), "pb": None,
+            "qa": q, "qb": q,
+            # a/b kept so anything downstream that still reads them survives
+            "a": worst, "b": places[-1]["name"],
+            "va": places[0]["value"], "vb": places[-1]["value"],
+            "layout": payload.get("layout") or "list",
+        }
+
     a = payload.get("entity_a") or "A"
     b = payload.get("entity_b") or "B"
     va = float(payload.get("value_a") or 0)
     vb = float(payload.get("value_b") or 0)
-    subject = payload.get("subject") or "cost of living"
 
     qa = payload.get("photo_query_a") or photo_query(a, subject)
     qb = payload.get("photo_query_b") or photo_query(b, subject)
