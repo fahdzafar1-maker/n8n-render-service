@@ -24,11 +24,23 @@ import subprocess, json, sys, re, os, argparse, tempfile, glob, collections
 
 # ---------------------------------------------------------------- thresholds
 T = {
-    "runtime_max":        420,    # 7:00 — is se lambi video tab tak nahi jab tak APV 40%+ na ho
-    "runtime_min":        240,    # 4:00
+    # --- LENGTH -----------------------------------------------------------
+    # 11 Sep 2026: 7:00 se 35:00. Ye andaza nahi, competitor data hai.
+    # Is niche ke teen sab se bare videos: 42:01 (355,380 views),
+    # 16:21 (249,393), 36:05 (123,087). Cold Facts America ke winners ka
+    # average 30 minute ke qareeb hai.
+    #
+    # Purani had 420s thi. Us par 18-minute ki har video LEN check fail karti
+    # aur min_score 8.0 se neeche gir kar W5 me ruk jati - poora naya format
+    # is ek line par mar jata. Isi liye ye sab se pehla fix hai.
+    "runtime_max":        2100,   # 35:00
+    "runtime_min":        900,    # 15:00
     "avg_shot_max":       6.0,    # seconds
     "longest_hold_max":   8.0,    # seconds
-    "layout_share_max":   0.15,   # ek layout max 15% runtime
+    # 0.15 se 0.22. Lambi video me ek hi metric 10+ jaghon par dohraya jata
+    # hai, to ek layout ka hissa qudrati taur par barh jata hai. 0.15 par wo
+    # asli variety hone ke bawajood fail hota.
+    "layout_share_max":   0.22,   # ek layout max 22% runtime
     "title_metric_max_t": 20.0,   # title ka metric pehle 20s me
     "hook_figure_max_t":  15.0,   # pehla number pehle 15s me
     "caption_max_chars":  32,
