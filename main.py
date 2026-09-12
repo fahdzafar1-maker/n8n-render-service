@@ -1085,6 +1085,21 @@ def make_thumbnail(req: ThumbnailRequest):
         "X-Thumb-Photos": "%s/%s" % (int(bool(spec.get("pa"))), int(bool(spec.get("pb")))),
         "X-Thumb-Warnings": ("; ".join(problems)[:400] or "none"),
     }
+    # The presenter's photograph is the one element of this thumbnail that can
+    # go missing without anything failing: face_layer() skips a missing file on
+    # purpose, so a thumbnail still gets made. It said so nowhere, and the face
+    # was absent from every published thumbnail for weeks because face.png was
+    # never committed alongside this service. Now it is in the response.
+    try:
+        drawn, why = thumbnail.face_status()
+        headers["X-Thumb-Face"] = "yes" if drawn else "NO"
+        headers["X-Thumb-Face-Reason"] = why[:200]
+        if not drawn and "not next to" in why:
+            headers["X-Thumb-Warnings"] = (
+                "NO FACE: face.png is missing from the render service. " +
+                headers["X-Thumb-Warnings"])
+    except Exception:
+        headers["X-Thumb-Face"] = "unknown"
     return Response(content=png, media_type="image/png", headers=headers)
 
 
@@ -1296,6 +1311,12 @@ def health():
         "pexels_key": bool(os.environ.get("PEXELS_API_KEY")),
         # names the face the thumbnails will actually draw with, so a missing
         # font package shows up here instead of in a published thumbnail
-        "thumbnail_font": (getattr(thumbnail, "_FP", None) or "NONE")
+        "thumbnail_font": (getattr(thumbnail, "_FP", None) or "NONE"),
+        # Confirms the presenter photograph shipped with this deploy. It is a
+        # file, not a package, so nothing else on this page would notice it.
+        "thumbnail_face_png": (
+            "present" if (thumbnail is not None and
+                          __import__("os").path.exists(getattr(thumbnail, "_FACE_PATH", "")))
+            else "MISSING - commit face.png next to thumbnail.py")
                           if thumbnail is not None else "module not loaded",
     }
