@@ -379,7 +379,7 @@ _EMITTED = []
 _BOXES = []          # non-text elements that must not sit under type
 
 
-def _t(x, y, s, size, fill=INK, anchor="middle"):
+def _t(x, y, s, size, fill=INK, anchor="middle", floor=None):
     tw = text_width(s, size)
     if anchor == "middle":
         x0, x1 = x - tw / 2.0, x + tw / 2.0
@@ -387,8 +387,13 @@ def _t(x, y, s, size, fill=INK, anchor="middle"):
         x0, x1 = x - tw, x
     else:
         x0, x1 = x, x + tw
+    # `floor` lets one string declare a lower minimum than MIN_TEXT. MIN_TEXT
+    # protects FIGURES, which have to survive the 120px preview; a quiet
+    # category caption beside the badge does not, and holding it to the figure
+    # floor meant truncating "ANNUAL INFANT CHILDCARE COST" to "INFANT".
     _EMITTED.append({"text": str(s), "size": size, "x0": x0, "x1": x1,
-                     "y0": y - size * 0.76, "y1": y + size * 0.24})
+                     "y0": y - size * 0.76, "y1": y + size * 0.24,
+                     "floor": floor})
     # Heavy type on a photograph needs its own edge or it vanishes the moment
     # the picture behind it goes pale. Drawn twice: a dark stroke, then fill.
     common = ('font-family="%s" font-size="%d" font-weight="900" text-anchor="%s"'
@@ -425,8 +430,9 @@ def validate(margin=26):
         if e["y0"] < 0 or e["y1"] > H:
             out.append('"%s" runs off vertically: y %.0f..%.0f'
                        % (e["text"][:26], e["y0"], e["y1"]))
-        if e["size"] < MIN_TEXT:
-            out.append('"%s" is %dpx, under the %dpx floor' % (e["text"][:26], e["size"], MIN_TEXT))
+        lim = e.get("floor") or MIN_TEXT
+        if e["size"] < lim:
+            out.append('"%s" is %dpx, under the %dpx floor' % (e["text"][:26], e["size"], lim))
     return out
 
 
@@ -472,15 +478,51 @@ _EMPH = re.compile(r"\b(REALLY|ACTUALLY|TRULY|EVER|WORTH|NOT)\b")
 _FACE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face.png")
 _FACE_CACHE = {}
 
+# ---- 12 Sep 2026: a missing face must not be a silent absence ------------
+# face_layer() was written to fail quietly - "no face must never mean no
+# thumbnail" - and that is still right. What was wrong was that it failed
+# quietly and told NOBODY. The presenter's photograph was in this sandbox and
+# never in the repository, so every thumbnail the service published for weeks
+# came out without a face, no error anywhere, and the only way to find out was
+# to look at one and notice something that is not there.
+#
+# The absence is now recorded and reported all the way out through the HTTP
+# response and the sheet, so "the face is missing" is something the pipeline
+# says out loud instead of something a person has to spot.
+_FACE_DRAWN = False
+_FACE_MISSING = []
 
-def face_layer(x_right=True, height=330):
-    """The host's cut-out, bottom-anchored at one side.
+
+def face_status():
+    """(drawn, reason) - for the /thumbnail response and the / health check."""
+    if _FACE_DRAWN:
+        return True, "drawn"
+    if _FACE_MISSING:
+        return False, "face.png is not next to thumbnail.py in the deployed repo"
+    if _FACE_CACHE.get("uri") is None and "uri" in _FACE_CACHE:
+        return False, "face.png is present but could not be read as an image"
+    return False, "this layout does not place a face"
+
+
+def face_layer(x_right=True, height=330, top=None):
+    """The host's cut-out at one side.
 
     Kept deliberately small. A face raises click-through, but the numbers are
     still the thing being sold, and a half-frame portrait buries them. Absent
     file = absent layer, silently: no face must never mean no thumbnail.
+
+    `top` places the TOP of the cut-out at that y. Without it the cut-out is
+    bottom-anchored, which is what the two-place layouts still want: there the
+    face stands beside a hook band that runs along the floor of the frame.
+
+    The list layout does not work that way. At 200px, bottom-anchored, the face
+    sat in the last quarter of the frame with the hook band across its chest -
+    small, low, and the first thing lost when YouTube shrinks the image to the
+    120px that actually decides the click.
     """
+    global _FACE_DRAWN
     if not os.path.exists(_FACE_PATH):
+        _FACE_MISSING.append(_FACE_PATH)
         return "", 0
     if "uri" not in _FACE_CACHE:
         try:
@@ -496,15 +538,21 @@ def face_layer(x_right=True, height=330):
     fw, fh = _FACE_CACHE["size"]
     w = int(height * fw / float(fh))
     x = (W - w - 8) if x_right else 8
-    y = H - height
+    y = int(top) if top is not None else (H - height)
     # Registered as a box so validate() can catch it colliding with type.
     # The first cut sat the face across the bottom of "$339K": every text
     # check passed, because the collision was text against IMAGE and nothing
     # was looking for that.
     _BOXES.append({"text": "[face]", "size": MIN_TEXT, "x0": x, "x1": x + w,
                    "y0": y, "y1": y + height})
-    return ('<image x="%d" y="%d" width="%d" height="%d" xlink:href="%s" '
-            'preserveAspectRatio="xMidYMax meet"/>' % (x, y, w, height, _FACE_CACHE["uri"]),
+    _FACE_DRAWN = True
+    return ('<image x="%d" y="%d" width="%d" height="%d" '
+            'preserveAspectRatio="%s meet" xlink:href="%s"/>' % (
+                x, y, w, height,
+                # Top-anchored when a top is given: the head is the part that
+                # has to survive, so the crop must eat the jacket, not the face.
+                "xMidYMin" if top is not None else "xMidYMax",
+                _FACE_CACHE["uri"]),
             w)
 
 
@@ -587,6 +635,9 @@ def _arrow(tip_x, tip_y, colour=None, length=96, lean=56):
     )
 
 
+HOOK_BASELINE = 646
+
+
 def _hook_band(hook, top=498, avoid_right=0):
     """The hook, with one word carried in amber.
 
@@ -613,7 +664,7 @@ def _hook_band(hook, top=498, avoid_right=0):
     x = (W - avoid_right - total) / 2.0
     out = ['<rect x="0" y="%d" width="%d" height="%d" fill="url(#hook)"/>' % (top, W, H - top)]
     for i, w in enumerate(words):
-        out.append(_t(int(x), 646, w, size, WARM if i == hi else INK, anchor="start"))
+        out.append(_t(int(x), HOOK_BASELINE, w, size, WARM if i == hi else INK, anchor="start"))
         x += widths[i] + space
     return "".join(out)
 
@@ -790,16 +841,62 @@ def _lay_list(d):
     bw = text_width(badge, bs) + 52
 
     lab = _context_label(d["subject"])
-    ls = fit(lab, 1180 - (54 + bw + 26), 54, MIN_TEXT)
 
     # Left column is the shock; right column is the proof there are more.
     # Kept apart on x so a long figure can never reach the chips.
     big = money(worst["value"])
-    bigs = fit(big, 690, 184, 110)
     wname = short_name(worst["name"], 14)
-    wns = fit(wname, 690, 74, MIN_TEXT)
 
-    face_svg, face_w = face_layer(x_right=True, height=200)
+    # ---- 12 Sep 2026: THE FACE MOVES UP AND GETS BIGGER -----------------
+    # It was 200px tall, bottom-anchored, in the last quarter of the frame,
+    # with the hook band running across its chest. At the 120px preview that
+    # actually decides a click it was a thumbnail-sized smudge in a corner.
+    #
+    # It is now 430px, top-anchored, on the right - more than twice the height
+    # and starting 40px from the top of the frame. That is a real change to
+    # the layout, not a nudge, so the right-hand column had to move with it:
+    # the three runner-up chips used to live at x=872..1228, exactly where the
+    # face now stands. They have come down into a single horizontal row under
+    # the big figure, which suits them better anyway - three chips in a row
+    # read as "and there are more of these", which is all they were ever for.
+    #
+    # One thing gets easier: the hook band no longer has to dodge the face, so
+    # it runs the full width of the frame instead of stopping short of it.
+    FACE_TOP = 34
+    FACE_H = 412
+    face_svg, face_w = face_layer(x_right=True, height=FACE_H, top=FACE_TOP)
+    left_room = (W - face_w - 40) if face_w else (W - 60)
+
+    # Everything on the left is measured against what the face leaves, so a
+    # bigger face can never push a figure off the frame - it shrinks the type
+    # instead, down to the 110px floor that is still legible at 120px.
+    # The category label shares the top line with the badge, and the face now
+    # stands in the top-right corner it used to run into. It is sized against
+    # what is left of that line, not against the frame: "ANNUAL INFANT
+    # CHILDCARE COST" measured against the full width printed straight across
+    # the presenter's head on three of five test topics.
+    lab_room = max(160, (W - face_w - 24) - (54 + bw + 26))
+    # The category label is the one string on this card allowed under
+    # MIN_TEXT. MIN_TEXT exists so a FIGURE stays readable at the 120px
+    # preview; this is a quiet caption sitting beside a badge, and at the
+    # floor it was being cut to "INFANT" and "COST OF" - shorter, legible,
+    # and meaningless. Two sizes smaller keeps the whole phrase.
+    LABEL_FLOOR = 38
+    ls = fit(lab, lab_room, 54, LABEL_FLOOR)
+    # fit() stops shrinking at MIN_TEXT and then simply returns a size that
+    # does not fit, which is how "ANNUAL INFANT CHILDCARE COST" ended up
+    # printed across the presenter's head. Below the floor, drop words from
+    # the end - a shorter true label beats a longer one that runs off.
+    while text_width(lab, ls) > lab_room and " " in lab.strip():
+        lab = lab.rsplit(" ", 1)[0].rstrip(" ,-")
+        ls = fit(lab, lab_room, 54, LABEL_FLOOR)
+    while text_width(lab, ls) > lab_room and len(lab) > 3:
+        lab = lab[:-1].rstrip(" ,-")
+
+    big_room = max(420, left_room - 60)
+    bigs = fit(big, big_room, 184, 110)
+    wns = fit(wname, big_room, 74, MIN_TEXT)
+    big_cx = 54 + big_room / 2
 
     out = [
         _defs(),
@@ -807,41 +904,63 @@ def _lay_list(d):
         '<rect x="0" y="0" width="%d" height="%d" fill="%s" opacity="0.54"/>' % (W, H, SHADE),
         '<rect x="0" y="0" width="%d" height="260" fill="url(#top)"/>' % W,
         # count badge, then the category beside it on the same line - the two
-        # together say "this many places, this thing" in one glance.
+        # together say "this many places, this thing" in one glance. Held to
+        # the left of the face.
         '<rect x="54" y="34" width="%.0f" height="78" rx="14" fill="%s"/>' % (bw, WARM),
         _t(54 + bw / 2, 90, badge, bs, SHADE),
-        _t(54 + bw + 26, 90, lab, ls, INK, anchor="start"),
+        _t(54 + bw + 26, 90, lab, ls, INK, anchor="start", floor=LABEL_FLOOR),
         # the shock
-        _t(392, 300, big, bigs, HIGH),
-        # 396 -> 412. At 184px the figure's descender reaches y=326 and the
-        # name's cap top was at 343: a 17px gap, under validate()'s 26px floor,
-        # and it failed on every single test topic. Measured, not nudged.
-        _t(392, 412, wname, wns, INK),
+        _t(big_cx, 300, big, bigs, HIGH),
+        # 396 -> 412 -> 428. At 184px the figure's descender reaches y=342 and
+        # the name's cap top has to clear it by validate()'s 26px floor.
+        _t(big_cx, 412, wname, wns, INK),
     ]
 
-    # the runners-up: postal code + figure. The name is fitted into whatever
-    # the FIGURE leaves, not into a fixed 150px - "JACKSON" at the 56px floor
-    # is wider than that and printed straight through "$1.9M".
-    cy = 196
-    for p in rest:
-        v = money(p["value"])
-        nm = chip_name(p["name"])
-        s2 = fit(v, 190, 58, MIN_TEXT)
-        room = 304 - text_width(v, s2) - 30
-        s1 = fit(nm, room, 56, MIN_TEXT)
-        while text_width(nm, s1) > room and len(nm) > 2:
-            nm = nm[:-1]                      # last resort: shorten the label
-        out.append('<rect x="872" y="%d" width="356" height="80" rx="12" fill="%s" opacity="0.82"/>'
-                   % (cy - 56, SHADE))
-        out.append(_t(898, cy, nm, s1, COOL, anchor="start"))
-        out.append(_t(1202, cy, v, s2, INK, anchor="end"))
-        cy += 96
+    # ---- the runner-up row, placed by measurement, not by taste ----------
+    # The chips used to be a stack beside the figure, in the column the face
+    # now occupies. As a row they have the whole width below the face - but
+    # only the width BELOW it, and only down to where the hook starts, and
+    # both of those edges move with the content. So both are measured and the
+    # row is centred in what is left, instead of being put at a y that looked
+    # right against one test topic and collided on the next.
+    hook_size = fit(d["hook"], W - 110, 108, MIN_TEXT)
+    hook_cap_top = HOOK_BASELINE - hook_size * 0.78
+    band_top = FACE_TOP + FACE_H + 18
+    band_bottom = hook_cap_top - 26          # validate()'s own floor
+    band_h = band_bottom - band_top
 
-    out.append(_hook_band(d["hook"], avoid_right=face_w))
-    # The arrow measures from the NAME, not the number - the name is the lowest
-    # thing in the left column, and pointing from the number's baseline put the
-    # shaft straight through it.
-    out.append(_arrow_between(392, 412, wns, d["hook"], face_w, lean=64))
+    if band_h >= 56:
+        chip_h = int(min(84, band_h))
+        cy = int(band_top + (band_h - chip_h) / 2.0 + chip_h * 0.72)
+        gap = 18
+        chip_w = int((W - 108 - gap * 2) / 3.0)
+        x0 = 54
+        for i, pl in enumerate(rest):
+            v = money(pl["value"])
+            nm = chip_name(pl["name"])
+            cx = x0 + i * (chip_w + gap)
+            # Fixed sub-boxes. Sizing the value first and giving the name
+            # whatever was left is what printed "CA" through "$2,610": a long
+            # figure could leave the name 40 pixels and the name does not fit
+            # in 40 pixels, so it overflowed its own half of the chip.
+            pad = 18
+            name_box = (chip_w - pad * 2) * 0.36
+            val_box = (chip_w - pad * 2) * 0.58
+            s1 = fit(nm, name_box, int(chip_h * 0.62), MIN_TEXT)
+            s2 = fit(v, val_box, int(chip_h * 0.66), MIN_TEXT)
+            out.append('<rect x="%d" y="%d" width="%d" height="%d" rx="12" fill="%s" opacity="0.82"/>'
+                       % (cx, cy - int(chip_h * 0.72), chip_w, chip_h, SHADE))
+            out.append(_t(cx + pad, cy, nm, s1, COOL, anchor="start"))
+            out.append(_t(cx + chip_w - pad, cy, v, s2, INK, anchor="end"))
+        arrow_from = cy
+    else:
+        # No honest room for them. Three unreadable chips are worse than none:
+        # the count badge at the top already promises the rest of the list.
+        arrow_from = 412
+
+    # The face no longer reaches the floor, so the hook gets the whole width.
+    out.append(_hook_band(d["hook"], avoid_right=0))
+    out.append(_arrow_between(int(big_cx), arrow_from, 54, d["hook"], 0, lean=64))
     out.append(face_svg)
     return "".join(out)
 
@@ -994,8 +1113,11 @@ def build_spec(payload):
 
 
 def render_svg(payload):
+    global _FACE_DRAWN
     del _EMITTED[:]
     del _BOXES[:]
+    del _FACE_MISSING[:]
+    _FACE_DRAWN = False
     d = build_spec(payload)
     name = d.get("layout") or choose_layout(d)
     if name not in LAYOUTS:
