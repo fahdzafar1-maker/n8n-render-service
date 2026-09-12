@@ -1041,16 +1041,31 @@ def visual_preview(req: VisualPreviewRequest):
             os.remove(tmp)
 
 
+class ThumbnailPlace(BaseModel):
+    name: str
+    value: float
+
+
 class ThumbnailRequest(BaseModel):
-    entity_a: str
-    entity_b: str
+    # 12 Sep 2026: entity_a/entity_b used to be required - that was the whole
+    # contract when every video was a two-place comparison. The channel now
+    # runs list/countdown videos by default, and those carry `places` instead
+    # (worst-to-best, one measure). W3's payload builder (w3_build_thumb_payload.js)
+    # sends ONE of the two shapes, never both, so both halves have to be
+    # optional here or every list-format thumbnail 422s before thumbnail.py
+    # (which already draws the list layout) ever sees the request.
+    entity_a: str = ""
+    entity_b: str = ""
     value_a: float = 0
     value_b: float = 0
+    places: List[ThumbnailPlace] = []   # list format: worst-first, one metric
+    count: int = 0                      # how many places the video covers
     subject: str = "cost of living"
     hook: str = ""            # 2-4 words, a question, never the answer
     photo_query_a: str = ""   # override the derived Pexels query
     photo_query_b: str = ""
-    layout: str = ""          # force split/diagonal/hero; normally left empty
+    photo_query: str = ""     # list format's single photo query override
+    layout: str = ""          # force split/diagonal/hero/list; normally left empty
 
 
 @app.post("/thumbnail")
